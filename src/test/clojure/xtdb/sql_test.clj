@@ -770,19 +770,28 @@
 
 (deftest test-sql-delete-plan
   (t/is (=plan-file "test-sql-delete-plan"
-                    (plan-sql "DELETE FROM users FOR PORTION OF VALID_TIME FROM DATE '2020-05-01' TO END_OF_TIME AS u WHERE u.id = ?"))))
+                    (plan-sql "DELETE FROM users FOR PORTION OF VALID_TIME FROM DATE '2020-05-01' TO END_OF_TIME AS u WHERE u.id = ?"
+                              {:table-info {"users" #{"id"}}}))))
+
+(deftest test-sql-erase-plan
+  (t/is (=plan-file "test-sql-erase-plan"
+                    (plan-sql "ERASE FROM users AS u WHERE u.id = ?"
+                              {:table-info {"users" #{"id"}}}))))
 
 (deftest test-sql-update-plan
   (t/is (=plan-file "test-sql-update-plan"
-                    (plan-sql "UPDATE users FOR PORTION OF VALID_TIME FROM DATE '2021-07-01' TO END_OF_TIME AS u SET first_name = 'Sue' WHERE u.id = ?")))
+                    (plan-sql "UPDATE users FOR PORTION OF VALID_TIME FROM DATE '2021-07-01' TO END_OF_TIME AS u SET first_name = 'Sue' WHERE u.id = ?"
+                              {:table-info {"users" #{"id" "first_name" "last_name"}}})))
 
   (t/is (=plan-file "test-sql-update-plan-with-column-references"
                     (plan-sql "UPDATE foo SET bar = foo.baz"
-                              {:default-all-valid-time? true})))
+                              {:table-info {"foo" #{"bar" "baz" "quux"}}
+                               :default-all-valid-time? true})))
 
   (t/is (=plan-file "test-sql-update-plan-with-period-references"
                     (plan-sql "UPDATE foo SET bar = (foo.SYSTEM_TIME OVERLAPS foo.VALID_TIME)"
-                              {:default-all-valid-time? true}))))
+                              {:table-info {"foo" #{"bar" "baz"}}
+                               :default-all-valid-time? true}))))
 
 (deftest dml-target-table-alises
   (t/is (= (plan-sql "UPDATE t1 AS u SET col1 = 30")

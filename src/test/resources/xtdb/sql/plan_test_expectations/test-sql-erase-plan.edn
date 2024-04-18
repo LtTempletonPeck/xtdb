@@ -1,0 +1,14 @@
+[:erase
+ {:table users}
+ [:project
+  [xt$iid xt$system_from xt$system_to xt$valid_from xt$valid_to]
+  [:select
+   (= id ?_0)
+   [:scan
+    {:for-system-time :all-time, :for-valid-time :all-time}
+    [xt$valid_to
+     xt$system_from
+     xt$iid
+     xt$system_to
+     xt$valid_from
+     id]]]]]
