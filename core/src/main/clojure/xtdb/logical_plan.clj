@@ -212,7 +212,7 @@
     [:rename prefix-or-columns relation]
     (if (symbol? prefix-or-columns)
       (vec (for [c (relation-columns relation)]
-             (symbol (str prefix-or-columns relation-prefix-delimiter  c))))
+             (symbol (str prefix-or-columns) (name c))))
       (replace prefix-or-columns (relation-columns relation)))
 
     [:project projection _]

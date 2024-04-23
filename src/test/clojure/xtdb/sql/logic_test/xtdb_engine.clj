@@ -8,6 +8,7 @@
             [xtdb.sql.logic-test.runner :as slt]
             [xtdb.sql.parser :as p]
             [xtdb.sql.plan :as plan]
+            [xtdb.sql.plan2 :as plan2]
             [xtdb.test-util :as tu]
             [xtdb.util :as util])
   (:import [java.time Instant]
@@ -238,9 +239,7 @@
 (defn preprocess-query [^String query]
   (let [query (str/replace query #"(FROM\s+?)\(((?:[^(])+?CROSS\s+JOIN.+?)\)" "$1$2")
         query (str/replace query "CROSS JOIN" ",")]
-    (if (re-find #"(?i)( FROM |^\s*VALUES)" query)
-      query
-      (str query " FROM (VALUES (0)) AS no_from"))))
+    query))
 
 (extend-protocol slt/DbEngine
   Node
@@ -263,12 +262,4 @@
               (execute-statement this direct-sql-data-statement-tree)))))))
 
   (execute-query [this query variables]
-    (if (:direct-sql slt/*opts*)
-      (execute-sql-query this query variables (select-keys slt/*opts* [:decorrelate?]))
-      (let [edited-query (preprocess-query query)
-            tree (p/parse edited-query :query_expression)]
-        (when (p/failure? tree)
-          (throw (err/illegal-arg :xtdb.sql/parse-error
-                                  {::err/message (p/failure->str tree)
-                                   :query query})))
-        (execute-query-expression this tree)))))
+    (execute-sql-query this query variables (select-keys slt/*opts* [:decorrelate?]))))
