@@ -665,7 +665,8 @@
           (plan-sql
             "SELECT foo.a - 4 AS bar
             FROM foo
-            GROUP BY foo.a"))))
+            GROUP BY foo.a"
+            {:table-info {"foo" #{"a"}}}))))
 
 (deftest test-array-subqueries
   (t/are [file q]

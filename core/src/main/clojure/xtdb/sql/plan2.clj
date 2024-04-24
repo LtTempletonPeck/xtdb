@@ -7,7 +7,7 @@
             [xtdb.util :as util])
   (:import clojure.lang.MapEntry
            (java.time Duration LocalDate LocalDateTime LocalTime OffsetTime Period ZoneId ZoneOffset ZonedDateTime)
-           (java.util Collection HashMap LinkedHashSet Map Set)
+           (java.util Collection HashMap HashSet LinkedHashSet Map Set)
            java.util.function.Function
            (org.antlr.v4.runtime CharStreams CommonTokenStream ParserRuleContext)
            (xtdb.antlr SqlLexer SqlLexer SqlParser SqlParser SqlParser$BaseTableContext SqlParser$BaseTableContext SqlParser$DirectSqlStatementContext SqlParser$IntervalQualifierContext SqlParser$IntervalQualifierContext SqlParser$JoinSpecificationContext SqlParser$JoinSpecificationContext SqlParser$JoinTypeContext SqlParser$JoinTypeContext SqlParser$ObjectNameAndValueContext SqlParser$ObjectNameAndValueContext SqlParser$SearchedWhenClauseContext SqlParser$SearchedWhenClauseContext SqlParser$SetClauseContext SqlParser$SetClauseContext SqlParser$SimpleWhenClauseContext SqlParser$SimpleWhenClauseContext SqlParser$SortSpecificationContext SqlParser$WhenOperandContext SqlParser$WhenOperandContext SqlParser$WithTimeZoneContext SqlParser$WithTimeZoneContext SqlVisitor SqlVisitor)
@@ -161,7 +161,7 @@
     (when-not (and chain (not= chain [table-alias]))
       cols))
 
-  (find-decl [_ [col-name table-name :as chain]]
+  (find-decl [_ [col-name table-name]]
     (when (or (nil? table-name) (= table-name table-alias))
       (when (or (contains? cols col-name) (types/temporal-column? col-name))
         (.computeIfAbsent !reqd-cols col-name
@@ -345,6 +345,41 @@
 
     (mapv val !extended-ob-col-refs)))
 
+(defrecord MissingGroupingColumns [missing-grouping-cols])
+
+(defrecord GroupInvariantColsTracker [env scope, ^Set !implied-gicrs]
+  SqlVisitor
+  (visitSelectClause [this ctx] (.accept (.getParent ctx) this))
+
+  (visitQuerySpecification [_ ctx]
+    (if-let [gbc (.groupByClause ctx)]
+      (let [grouping-cols (vec (for [^ParserRuleContext grp-el (.groupingElement gbc)]
+                                 (.accept grp-el
+                                          (reify SqlVisitor
+                                            (visitOrdinaryGroupingSet [_ ctx]
+                                              (.accept (.columnReference ctx) (->ExprPlanVisitor env scope)))))))]
+
+        (if-let [missing-grouping-cols (not-empty (set/difference (set !implied-gicrs) (set grouping-cols)))]
+          (add-err! env (->MissingGroupingColumns missing-grouping-cols))
+          grouping-cols))
+
+      (for [col-ref !implied-gicrs]
+        col-ref)))
+
+  Scope
+  (available-cols [_ table-name] (available-cols scope table-name))
+
+  (find-decl [_ chain]
+    (when-let [sym (find-decl scope chain)]
+      (some-> !implied-gicrs (.add sym))
+      sym)))
+
+(defn- wrap-aggs [plan aggs group-invariant-cols]
+  [:group-by (vec (concat group-invariant-cols
+                          (for [[agg-sym expr] aggs]
+                            {agg-sym expr})))
+   plan])
+
 (defrecord ScopeVisitor [env scope]
   SqlVisitor
   (visitFromClause [this ctx]
@@ -407,6 +442,7 @@
   (visitSelectClause [_ ctx]
     (let [sl-ctx (.selectList ctx)
           !subqs (HashMap.)
+          !aggs (HashMap.)
 
           projected-cols (if (.ASTERISK sl-ctx)
                            (vec (for [col-name (available-cols scope nil)
@@ -419,7 +455,8 @@
                                                   (.accept (.getChild sl-elem 0)
                                                            (reify SqlVisitor
                                                              (visitDerivedColumn [_ ctx]
-                                                               [(let [expr (.accept (.expr ctx) (map->ExprPlanVisitor {:env env, :scope scope, :!subqs !subqs}))]
+                                                               [(let [expr (.accept (.expr ctx)
+                                                                                    (map->ExprPlanVisitor {:env env, :scope scope, :!subqs !subqs, :!aggs !aggs}))]
                                                                   (if-let [as-clause (.asClause ctx)]
                                                                     (let [col-name (identifier-sym as-clause)]
                                                                       (->ProjectedCol {col-name expr} col-name))
@@ -442,7 +479,8 @@
                                                cat))))]
 
       {:projected-cols (into projected-cols (extended-ob-col-refs order-by-specs env scope (into #{} (map :col-sym) projected-cols)))
-       :subqs (not-empty (into {} !subqs))})))
+       :subqs (not-empty (into {} !subqs))
+       :aggs (not-empty (into {} !aggs))})))
 
 (defn- project-all-cols [env scope order-by-specs]
   ;; duplicated from the ASTERISK case above
@@ -612,6 +650,8 @@
        :cast-opts (when interval-qualifier (iq-context->iq-map interval-qualifier))}))
 
   (visitCharacterStringType [_ _] {:cast-type :utf8}))
+
+(defrecord AggregatesDisallowed [])
 
 (defrecord ExprPlanVisitor [env scope]
   SqlVisitor
@@ -1098,6 +1138,41 @@
         (cond-> (list 'cast ve cast-type)
           (not-empty cast-opts) (concat [cast-opts])))))
 
+  (visitAggregateFunctionExpr [{:keys [!aggs] :as this} ctx]
+    (if-not !aggs
+      (add-err! env (->AggregatesDisallowed))
+      (-> (.aggregateFunction ctx) (.accept this))))
+
+  (visitCountStarFunction [{{:keys [!id-count]} :env, :keys [^Map !aggs]} ctx]
+    (let [agg-sym (-> (symbol (str "xt$row_count_" (swap! !id-count inc)))
+                      (vary-meta assoc :agg-out-sym? true))]
+      (.put !aggs agg-sym '(row-count))
+      agg-sym))
+
+  (visitArrayAggFunction [{{:keys [!id-count]} :env, :keys [^Map !aggs], :as this} ctx]
+    (if (.sortSpecificationList ctx)
+      (throw (UnsupportedOperationException. "array-agg sort-spec"))
+
+      (let [agg-sym (-> (symbol (str "xt$array_agg_" (swap! !id-count inc)))
+                        (vary-meta assoc :agg-out-sym? true))]
+        (.put !aggs agg-sym
+              (list 'array-agg
+                    (-> (.expr ctx)
+                        (.accept (assoc this :!aggs nil, :scope (assoc scope :!implied-gicrs nil))))))
+
+        agg-sym)))
+
+  (visitSetFunction [{{:keys [!id-count]} :env, :keys [^Map !aggs], :as this} ctx]
+    (let [set-fn (str/lower-case (.getText (.setFunctionType ctx)))
+          agg-sym (-> (symbol (str "xt$" set-fn "_" (swap! !id-count inc)))
+                      (vary-meta assoc :agg-out-sym? true))]
+      (.put !aggs agg-sym
+            (list (symbol set-fn)
+                  (-> (.expr ctx)
+                      (.accept (assoc this :!aggs nil, :scope (assoc scope :!implied-gicrs nil))))))
+
+      agg-sym))
+
   (visitScalarSubqueryExpr [{:keys [!subqs]} ctx]
     (plan-sq (.subquery ctx) env scope !subqs
              {:sq-type :scalar}))
@@ -1319,17 +1394,23 @@
                          {:predicate (.accept (.expr where-clause) (map->ExprPlanVisitor {:env env, :scope qs-scope, :!subqs !subqs}))
                           :subqs (not-empty (into {} !subqs))}))
 
+          group-invar-col-tracker (->GroupInvariantColsTracker env qs-scope (HashSet.))
+
           select-clause (.selectClause ctx)
 
           select-plan (if select-clause
-                        (.accept select-clause (->SelectClauseProjectedCols env qs-scope order-by-specs))
-                        (project-all-cols env qs-scope order-by-specs))
+                        (.accept select-clause (->SelectClauseProjectedCols env group-invar-col-tracker order-by-specs))
+                        (project-all-cols env group-invar-col-tracker order-by-specs))
 
           plan (as-> (plan-scope qs-scope) plan
                  (if-let [{:keys [predicate subqs]} where-plan]
                    [:select predicate
                     (-> plan (apply-sqs subqs))]
                    plan)
+
+                 (let [{:keys [aggs]} select-plan]
+                   (cond-> plan
+                     (or aggs (.groupByClause ctx)) (wrap-aggs aggs (.accept ctx group-invar-col-tracker))))
 
                  (let [{:keys [projected-cols subqs]} select-plan]
                    [:project (mapv :projection projected-cols)
@@ -1718,6 +1799,6 @@
          (vary-meta assoc :param-count @!param-count)))))
 
 (comment
-  (plan-statement "SELECT * FROM foo JOIN bar USING (baz)"
+  (plan-statement "SELECT bar, COUNT(baz) FROM foo"
                   {:table-info {"foo" #{"bar" "baz"}
                                 "bar" #{"baz" "quux"}}}))
