@@ -1,5 +1,6 @@
 (ns xtdb.sql.plan2
-  (:require [clojure.string :as str]
+  (:require [clojure.set :as set]
+            [clojure.string :as str]
             [xtdb.error :as err]
             [xtdb.logical-plan :as lp]
             [xtdb.types :as types]
@@ -374,6 +375,18 @@
 
       (->JoinTable env l r (.joinType ctx) (.joinSpecification ctx)
                    common-cols)))
+
+  (visitCrossJoinTable [this ctx]
+    (let [l (-> (.tableReference ctx 0) (.accept this))
+          r (-> (.tableReference ctx 1) (.accept this))]
+      (->JoinTable env l r :cross-join nil nil)))
+
+  (visitNaturalJoinTable [this ctx]
+    (let [l (-> (.tableReference ctx 0) (.accept this))
+          r (-> (.tableReference ctx 1) (.accept this))
+          common-cols (set/intersection (available-cols l nil) (available-cols r nil))]
+
+      (->JoinTable env l r (.joinType ctx) nil common-cols)))
 
   (visitDerivedTable [{{:keys [!id-count]} :env} ctx]
     (let [{:keys [plan col-syms]} (-> (.subquery ctx) (.queryExpression)
