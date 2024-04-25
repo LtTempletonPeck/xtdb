@@ -162,12 +162,11 @@
 
   (find-decl [_ [col-name table-name :as chain]]
     (when (or (nil? table-name) (= table-name table-alias))
-      (if (or (contains? cols col-name) (types/temporal-column? col-name))
+      (when (or (contains? cols col-name) (types/temporal-column? col-name))
         (.computeIfAbsent !reqd-cols col-name
                           (reify Function
                             (apply [_ col]
-                              (symbol (str unique-table-alias) (str col)))))
-        (add-err! env (->ColumnNotFound chain)))))
+                              (symbol (str unique-table-alias) (str col))))))))
 
   (plan-scope [{{:keys [default-all-valid-time?]} :env, :as this}]
     (let [expr-visitor (->ExprPlanVisitor env this)]
@@ -188,7 +187,8 @@
 
 (defrecord JoinTable [env l r
                       ^SqlParser$JoinTypeContext join-type-ctx
-                      ^SqlParser$JoinSpecificationContext join-spec-ctx]
+                      ^SqlParser$JoinSpecificationContext join-spec-ctx
+                      common-cols]
   Scope
   (available-cols [_ chain]
     (->> [l r]
@@ -196,7 +196,9 @@
                         (distinct)))))
 
   (find-decl [_ chain]
-    (let [matches (->> [l r]
+    (let [matches (->> (if (and (= 1 (count chain))
+                                (get common-cols (first chain)))
+                         [l] [l r])
                        (keep (fn [scope]
                                (find-decl scope chain))))]
       (when (> (count matches) 1)
@@ -214,13 +216,18 @@
                       "FULL" :full-outer-join
                       :join)
 
-          join-cond (or (some-> join-spec-ctx
-                                (.accept
-                                 (reify SqlVisitor
-                                   (visitJoinCondition [_ ctx]
-                                     (let [expr-visitor (->ExprPlanVisitor env this-scope)]
-                                       [(-> (.expr ctx)
-                                            (.accept expr-visitor))])))))
+          join-cond (or (if common-cols
+                          (vec (for [col-name (doto common-cols prn)]
+                                 {(find-decl l [col-name])
+                                  (find-decl r [col-name])}))
+
+                          (some-> join-spec-ctx
+                                  (.accept
+                                   (reify SqlVisitor
+                                     (visitJoinCondition [_ ctx]
+                                       (let [expr-visitor (->ExprPlanVisitor env this-scope)]
+                                         [(-> (.expr ctx)
+                                              (.accept expr-visitor))]))))))
                         [])
           planned-l (plan-scope l)
           planned-r (plan-scope r)]
@@ -357,8 +364,16 @@
 
   (visitJoinTable [this ctx]
     (let [l (-> (.tableReference ctx 0) (.accept this))
-          r (-> (.tableReference ctx 1) (.accept this))]
-      (->JoinTable env l r (.joinType ctx) (.joinSpecification ctx))))
+          r (-> (.tableReference ctx 1) (.accept this))
+          common-cols (.accept (.joinSpecification ctx)
+                            (reify SqlVisitor
+                              (visitJoinCondition [_ _] nil)
+                              (visitNamedColumnsJoin [_ ctx]
+                                (->> (.columnNameList ctx) (.columnName)
+                                     (into #{} (map identifier-sym))))))]
+
+      (->JoinTable env l r (.joinType ctx) (.joinSpecification ctx)
+                   common-cols)))
 
   (visitDerivedTable [{{:keys [!id-count]} :env} ctx]
     (let [{:keys [plan col-syms]} (-> (.subquery ctx) (.queryExpression)
@@ -1537,7 +1552,7 @@
                                         :let [col-sym (symbol col)]]
                                     (if-let [expr (get set-clauses col)]
                                       {col-sym expr}
-                                      (find-decl dml-scope col-sym)))))]
+                                      (find-decl dml-scope [col-sym])))))]
 
       (->UpdateStmt (symbol table-name)
                     (->QueryExpr [:project projection
@@ -1690,6 +1705,6 @@
          (vary-meta assoc :param-count @!param-count)))))
 
 (comment
-  (plan-statement "SELECT bar + 1 as inc_bar FROM foo ORDER by inc_bar, 1, baz"
+  (plan-statement "SELECT * FROM foo JOIN bar USING (baz)"
                   {:table-info {"foo" #{"bar" "baz"}
                                 "bar" #{"baz" "quux"}}}))
