@@ -9,14 +9,14 @@
            (java.util Collection HashMap LinkedHashSet Map)
            java.util.function.Function
            (org.antlr.v4.runtime CharStreams CommonTokenStream ParserRuleContext)
-           (xtdb.antlr SqlLexer SqlParser SqlParser$SetClauseContext SqlParser$BaseTableContext SqlParser$DirectSqlStatementContext SqlParser$IntervalQualifierContext SqlParser$JoinSpecificationContext SqlParser$JoinTypeContext SqlParser$ObjectNameAndValueContext SqlParser$SearchedWhenClauseContext SqlParser$SimpleWhenClauseContext SqlParser$WhenOperandContext SqlParser$WithTimeZoneContext SqlVisitor)
+           (xtdb.antlr SqlLexer SqlParser SqlParser$BaseTableContext SqlParser$DirectSqlStatementContext SqlParser$IntervalQualifierContext SqlParser$JoinSpecificationContext SqlParser$JoinTypeContext SqlParser$ObjectNameAndValueContext SqlParser$SearchedWhenClauseContext SqlParser$SetClauseContext SqlParser$SimpleWhenClauseContext SqlParser$WhenOperandContext SqlParser$WithTimeZoneContext SqlVisitor)
            (xtdb.types IntervalMonthDayNano)))
 
 (defn- add-err! [{:keys [!errors]} err]
   (swap! !errors conj err)
   nil)
 
-(declare ->ExprPlanVisitor ->QueryPlanVisitor)
+(declare ->ExprPlanVisitor map->ExprPlanVisitor ->QueryPlanVisitor)
 
 (defn identifier-sym [^ParserRuleContext ctx]
   (some-> ctx
@@ -45,6 +45,80 @@
 
   (plan-scope [_]
     [:table [{}]]))
+
+(defrecord SubqueryDisallowed [])
+
+(defn- ->sq-sym [sym {:keys [!id-count]} ^Map !sq-refs]
+  (when sym
+    (.computeIfAbsent !sq-refs sym
+                      (reify Function
+                        (apply [_ sym]
+                          (-> (symbol (format "?xt$sq_%s_%d" (name sym) (dec (swap! !id-count inc))))
+                              (vary-meta assoc :correlated-column? true)))))))
+
+(defrecord SubqueryScope [env, scope, ^Map !sq-refs]
+  Scope
+  (find-decl [_ chain]
+    (-> (find-decl scope chain)
+        (->sq-sym env !sq-refs))))
+
+(defn- plan-sq [^ParserRuleContext sq-ctx, env, scope, ^Map !subqs, sq-opts]
+  (if-not !subqs
+    (add-err! env (->SubqueryDisallowed))
+
+    (let [sq-sym (-> (symbol (str "xt$sq_" (count !subqs)))
+                     (vary-meta assoc :column? true))
+          !sq-refs (HashMap.)
+          query-plan (-> sq-ctx (.accept (->QueryPlanVisitor env (->SubqueryScope env scope !sq-refs))))]
+
+      (.put !subqs sq-sym (-> sq-opts
+                              (assoc :query-plan query-plan
+                                     :sq-refs (into {} !sq-refs))))
+
+      sq-sym)))
+
+(defn- apply-sqs [plan subqs]
+  (reduce-kv (fn [plan sq-sym {:keys [query-plan sq-type sq-refs] :as sq}]
+               (case sq-type
+                 :scalar [:apply :single-join sq-refs
+                          plan
+                          [:project [{sq-sym (first (:col-syms query-plan))}]
+                           (:plan query-plan)]]
+
+                 :nest-one [:apply :single-join sq-refs
+                            plan
+                            [:project [{sq-sym (->> (for [col-sym (:col-syms query-plan)]
+                                                      (MapEntry/create (keyword col-sym) col-sym))
+                                                    (into {}))}]
+                             (:plan query-plan)]]
+
+                 :nest-many [:apply :single-join sq-refs
+                             plan
+                             [:group-by [{sq-sym (list 'array_agg sq-sym)}]
+                              [:project [{sq-sym (->> (for [col-sym (:col-syms query-plan)]
+                                                        (MapEntry/create (keyword col-sym) col-sym))
+                                                      (into {}))}]
+                               (:plan query-plan)]]]
+
+                 :array-by-query [:apply :single-join sq-refs
+                                  plan
+                                  [:group-by [{sq-sym (list 'array_agg (first (:col-syms query-plan)))}]
+                                   (:plan query-plan)]]
+
+
+                 :exists [:apply {:mark-join {sq-sym true}} sq-refs
+                          plan
+                          (:plan query-plan)]
+
+                 :quantified-comparison (let [{:keys [expr op]} sq]
+                                          [:apply
+                                           {:mark-join {sq-sym (list op 'xt$needle (first (:col-syms query-plan)))}}
+                                           sq-refs
+                                           [:map [{'xt$needle expr}]
+                                            plan]
+                                           (:plan query-plan)])))
+             plan
+             subqs))
 
 (defrecord AmbiguousColumnReference [chain])
 (defrecord ColumnNotFound [chain])
@@ -169,7 +243,7 @@
     [:rename unique-table-alias
      plan]))
 
-(defrecord FromClauseScope [env table-ref-scopes]
+(defrecord FromClauseScope [env inner-scope table-ref-scopes]
   Scope
   (available-cols [_ chain]
     (->> table-ref-scopes
@@ -182,7 +256,8 @@
       (when (> (count matches) 1)
         (add-err! env (->AmbiguousColumnReference chain)))
 
-      (first matches)))
+      (or (first matches)
+          (find-decl inner-scope chain))))
 
   (plan-scope [_]
     (case (count table-ref-scopes)
@@ -203,11 +278,18 @@
 
 (defrecord ProjectedCol [projection col-sym])
 
+(defn- negate-op [op]
+  (case op
+    = '<>, <> '=
+    < '>=, > '<=
+    <= '>, >= '<))
+
 (defrecord ScopeVisitor [env scope]
   SqlVisitor
   (visitFromClause [this ctx]
-    (->FromClauseScope env (->> (.tableReference ctx)
-                                (mapv #(.accept ^ParserRuleContext % this)))))
+    (->FromClauseScope env scope
+                       (->> (.tableReference ctx)
+                            (mapv #(.accept ^ParserRuleContext % this)))))
 
   (visitBaseTable [{{:keys [!id-count table-info]} :env} ctx]
     (let [tn (some-> (.tableOrQueryName ctx) (.tableName))
@@ -242,45 +324,47 @@
 (defrecord SelectClauseProjectedCols [env scope]
   SqlVisitor
   (visitSelectClause [_ ctx]
-    (let [sl-ctx (.selectList ctx)]
-      (if (.ASTERISK sl-ctx)
-        (vec (for [col-name (available-cols scope nil)
-                   :let [sym (find-decl scope [col-name])]]
-               (->ProjectedCol sym sym)))
+    (let [sl-ctx (.selectList ctx)
+          !subqs (HashMap.)]
+      {:projected-cols (if (.ASTERISK sl-ctx)
+                         (vec (for [col-name (available-cols scope nil)
+                                    :let [sym (find-decl scope [col-name])]]
+                                (->ProjectedCol sym sym)))
 
-        (->> (.selectSublist sl-ctx)
-             (into [] (comp (map-indexed
-                             (fn [col-idx ^ParserRuleContext sl-elem]
-                               (.accept (.getChild sl-elem 0)
-                                        (reify SqlVisitor
-                                          (visitDerivedColumn [_ ctx]
-                                            [(let [expr (.accept (.expr ctx) (->ExprPlanVisitor env scope))]
-                                               (if-let [as-clause (.asClause ctx)]
-                                                 (let [col-name (identifier-sym as-clause)]
-                                                   (->ProjectedCol {col-name expr} col-name))
+                         (->> (.selectSublist sl-ctx)
+                              (into [] (comp (map-indexed
+                                              (fn [col-idx ^ParserRuleContext sl-elem]
+                                                (.accept (.getChild sl-elem 0)
+                                                         (reify SqlVisitor
+                                                           (visitDerivedColumn [_ ctx]
+                                                             [(let [expr (.accept (.expr ctx) (map->ExprPlanVisitor {:env env, :scope scope, :!subqs !subqs}))]
+                                                                (if-let [as-clause (.asClause ctx)]
+                                                                  (let [col-name (identifier-sym as-clause)]
+                                                                    (->ProjectedCol {col-name expr} col-name))
 
-                                                 (if (symbol? expr)
-                                                   (->ProjectedCol expr expr)
-                                                   (let [col-name (symbol (str "xt$column_" (inc col-idx)))]
-                                                     (->ProjectedCol {col-name expr} col-name)))))])
+                                                                  (if (symbol? expr)
+                                                                    (->ProjectedCol expr expr)
+                                                                    (let [col-name (symbol (str "xt$column_" (inc col-idx)))]
+                                                                      (->ProjectedCol {col-name expr} col-name)))))])
 
-                                          (visitQualifiedAsterisk [_ ctx]
-                                            (let [[table-name schema-name] (rseq (mapv identifier-sym (.identifier (.identifierChain ctx))))]
-                                              (when schema-name
-                                                (throw (UnsupportedOperationException. "schema not supported")))
+                                                           (visitQualifiedAsterisk [_ ctx]
+                                                             (let [[table-name schema-name] (rseq (mapv identifier-sym (.identifier (.identifierChain ctx))))]
+                                                               (when schema-name
+                                                                 (throw (UnsupportedOperationException. "schema not supported")))
+                                                               (if-let [table-cols (available-cols scope table-name)]
+                                                                 (for [col-name table-cols
+                                                                       :let [sym (find-decl scope [col-name table-name])]]
+                                                                   (->ProjectedCol sym sym))
+                                                                 (throw (UnsupportedOperationException. (str "Table not found: " table-name))))))))))
+                                             cat))))
 
-                                              (if-let [table-cols (available-cols scope [table-name])]
-                                                (for [col-name table-cols
-                                                      :let [sym (find-decl scope [col-name table-name])]]
-                                                  (->ProjectedCol sym sym))
-                                                (throw (UnsupportedOperationException. (str "Table not found: " table-name))))))))))
-                            cat)))))))
+       :subqs (not-empty (into {} !subqs))})))
 
 (defn- project-all-cols [scope]
   ;; duplicated from the ASTERISK case above
-  (vec (for [col-name (available-cols scope nil)
-             :let [sym (find-decl scope [col-name])]]
-         (->ProjectedCol sym sym))))
+  {:projected-cols (vec (for [col-name (available-cols scope nil)
+                              :let [sym (find-decl scope [col-name])]]
+                          (->ProjectedCol sym sym)))})
 
 (defn seconds-fraction->nanos ^long [seconds-fraction]
   (if seconds-fraction
@@ -746,11 +830,6 @@
         (list 'not expr)
         expr)))
 
-  ;; TODO
-  ;; (visitInPredicate [this ctx])
-  ;; (visitQuantifiedComparisonPredicate [this ctx])
-  ;; (visitExistsPredicate [this ctx])
-
   (visitPeriodOverlapsPredicate [this ctx]
     (let [p1 (-> (.periodPredicand ctx 0) (.accept this))
           p2 (-> (.periodPredicand ctx 1) (.accept this))]
@@ -807,7 +886,7 @@
       {:from pit :to pit}))
 
   (visitHasTablePrivilegePredicate [_ _] true)
-  (visitHasSchemaPrivilegePredicate [_ _23] true)
+  (visitHasSchemaPrivilegePredicate [_ _] true)
 
   (visitCurrentDateFunction [_ _] '(current-date))
   (visitCurrentTimeFunction [_ ctx] (fn-with-precision 'current-time (.precision ctx)))
@@ -928,7 +1007,75 @@
       (if ->cast-fn
         (->cast-fn ve)
         (cond-> (list 'cast ve cast-type)
-          (not-empty cast-opts) (concat [cast-opts]))))))
+          (not-empty cast-opts) (concat [cast-opts])))))
+
+  (visitScalarSubqueryExpr [{:keys [!subqs]} ctx]
+    (plan-sq (.subquery ctx) env scope !subqs
+             {:sq-type :scalar}))
+
+  (visitNestOneSubqueryExpr [{:keys [!subqs]} ctx]
+    (plan-sq (.subquery ctx) env scope !subqs
+             {:sq-type :nest-one}))
+
+  (visitNestManySubqueryExpr [{:keys [!subqs]} ctx]
+    (plan-sq (.subquery ctx) env scope !subqs
+             {:sq-type :nest-many}))
+
+  (visitArrayValueConstructorByQuery [{:keys [!subqs]} ctx]
+    (plan-sq (.subquery ctx) env scope !subqs
+             {:sq-type :array-by-query}))
+
+  (visitExistsPredicate [{:keys [!subqs]} ctx]
+    (plan-sq (.subquery ctx) env scope !subqs
+             {:sq-type :exists}))
+
+  (visitQuantifiedComparisonPredicate [{:keys [!subqs] :as this} ctx]
+    (let [quantifier (case (str/lower-case (.getText (.quantifier ctx)))
+                       "all" :all
+                       ("some" "any") :any)
+          op (symbol (.getText (.compOp ctx)))]
+      (plan-sq (.subquery ctx) env scope !subqs
+               {:sq-type :quantified-comparison
+                :expr (.accept (.expr ctx) this)
+                :op (cond-> op
+                      (= quantifier :all) negate-op)})))
+
+  (visitQuantifiedComparisonPredicatePart2 [{:keys [pt1 !subqs]} ctx]
+    (let [quantifier (case (str/lower-case (.getText (.quantifier ctx)))
+                       "all" :all
+                       ("some" "any") :any)
+          op (symbol (.getText (.compOp ctx)))]
+      (plan-sq (.subquery ctx) env scope !subqs
+               {:sq-type :quantified-comparison
+                :expr pt1
+                :op (cond-> op
+                      (= quantifier :all) negate-op)})))
+
+  (visitInPredicate [{:keys [!subqs] :as this} ctx]
+    (let [^ParserRuleContext
+          sq-ctx (.accept (.inPredicateValue ctx)
+                          (reify SqlVisitor
+                            (visitInSubquery [_ ctx] (.subquery ctx))
+                            (visitInRowValueList [_ ctx] (.rowValueList ctx))))]
+
+      (cond->> (plan-sq sq-ctx env scope !subqs
+                        {:sq-type :quantified-comparison
+                         :expr (.accept (.expr ctx) this)
+                         :op '=})
+        (boolean (.NOT ctx)) (list 'not))))
+
+  (visitInPredicatePart2 [{:keys [pt1 !subqs]} ctx]
+    (let [^ParserRuleContext
+          sq-ctx (.accept (.inPredicateValue ctx)
+                          (reify SqlVisitor
+                            (visitInSubquery [_ ctx] (.subquery ctx))
+                            (visitInRowValueList [_ ctx] (.rowValueList ctx))))]
+
+      (cond->> (plan-sq sq-ctx env scope !subqs
+                        {:sq-type :quantified-comparison
+                         :expr pt1
+                         :op '=})
+        (boolean (.NOT ctx)) (list 'not)))))
 
 (defrecord ColumnCountMismatch [expected given])
 
@@ -1002,25 +1149,28 @@
                      (.accept from (->ScopeVisitor env scope))
                      scope)
 
-          where-pred (when-let [where-clause (.whereClause ctx)]
-                       (.accept (.expr where-clause) (->ExprPlanVisitor env qs-scope)))
+          where-plan (when-let [where-clause (.whereClause ctx)]
+                       (let [!subqs (HashMap.)]
+                         {:predicate (.accept (.expr where-clause) (map->ExprPlanVisitor {:env env, :scope qs-scope, :!subqs !subqs}))
+                          :subqs (not-empty (into {} !subqs))}))
 
           select-clause (.selectClause ctx)
 
-          select-projected-cols (if select-clause
-                                  (.accept select-clause (->SelectClauseProjectedCols env qs-scope))
-                                  (project-all-cols qs-scope))
+          select-plan (if select-clause
+                        (.accept select-clause (->SelectClauseProjectedCols env qs-scope))
+                        (project-all-cols qs-scope))
 
           plan (as-> (plan-scope qs-scope) plan
-                 (if where-pred
-                   [:select where-pred
-                    plan]
+                 (if-let [{:keys [predicate subqs]} where-plan]
+                   [:select predicate
+                    (-> plan (apply-sqs subqs))]
                    plan)
 
-                 [:project (mapv :projection select-projected-cols)
-                  plan])]
+                 (let [{:keys [projected-cols subqs]} select-plan]
+                   [:project (mapv :projection projected-cols)
+                    (-> plan (apply-sqs subqs))]))]
 
-      (as-> (->QueryExpr plan (mapv :col-sym select-projected-cols))
+      (as-> (->QueryExpr plan (mapv :col-sym (:projected-cols select-plan)))
           {:keys [plan col-syms] :as query-expr}
 
         (if out-col-syms
@@ -1082,6 +1232,8 @@
 
                    (->> col-syms
                         (mapv #(symbol (str unique-table-alias) (str %)))))))
+
+  (visitSubquery [this ctx] (-> (.queryExpression ctx) (.accept this)))
 
   (visitInsertValues [this ctx]
     (let [out-col-syms (->> (.columnName (.columnNameList ctx))
@@ -1269,6 +1421,7 @@
                                        (throw (UnsupportedOperationException. "TODO")))
                                    (atom (set internal-cols)))
 
+          ;; TODO support subqs
           where-selection (some-> (.searchCondition ctx)
                                   (.accept (->ExprPlanVisitor env dml-scope)))
 
@@ -1290,6 +1443,7 @@
                                          (throw (UnsupportedOperationException. "TODO")))
                                      (atom '#{xt$iid}))
 
+          ;; TODO support subqs
           where-selection (some-> (.searchCondition ctx)
                                   (.accept (->ExprPlanVisitor env dml-scope)))]
 
@@ -1397,6 +1551,6 @@
          (vary-meta assoc :param-count @!param-count)))))
 
 (comment
-  (plan-statement "UPDATE foo SET bar = baz WHERE baz = 4"
+  (plan-statement "SELECT bar, EXISTS (SELECT quux FROM bar WHERE quux = baz) FROM foo"
                   {:table-info {"foo" #{"bar" "baz"}
                                 "bar" #{"baz" "quux"}}}))

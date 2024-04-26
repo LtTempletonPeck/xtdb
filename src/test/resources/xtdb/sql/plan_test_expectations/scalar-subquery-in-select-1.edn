@@ -1,0 +1,9 @@
+[:project
+ [{some_column (= 1 xt$subq_0)}]
+ [:apply
+  :single-join
+  {}
+  [:select (= y 1) [:scan {:table x} [y]]]
+  [:project
+   [{xt$subq_0 bar}]
+   [:project [bar] [:scan {:table foo} [bar]]]]]]

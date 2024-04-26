@@ -107,12 +107,12 @@
   (t/is (=plan-file
           "basic-query-11"
           (plan-sql "SELECT * FROM StarsIn AS si(name)"
-                    {:table-info {"stars_in" #{"name"}}})))
+                    {:table-info {"stars_in" #{"name" "title"}}})))
 
   (t/is (=plan-file
           "basic-query-11"
           (plan-sql "FROM StarsIn AS si(name)"
-                    {:table-info {"stars_in" #{"name"}}}))
+                    {:table-info {"stars_in" #{"name" "title"}}}))
         "implicit SELECT *")
 
   (t/is (=plan-file
@@ -283,7 +283,13 @@
 (deftest test-subqueries
   (t/testing "Scalar subquery in SELECT"
     (t/is (=plan-file
-            "scalar-subquery-in-select"
+            "scalar-subquery-in-select-1"
+            (plan-sql "SELECT (1 = (SELECT bar FROM foo)) AS some_column FROM x WHERE y = 1"
+                      {:table-info {"x" #{"y"}
+                                    "foo" #{"bar"}}})))
+
+    (t/is (=plan-file
+            "scalar-subquery-in-select-2"
             (plan-sql "SELECT (1 = (SELECT MAX(foo.bar) FROM foo)) AS some_column FROM x WHERE x.y = 1"
                       {:table-info {"x" #{"y"}
                                     "foo" #{"bar"}}}))))
@@ -641,10 +647,24 @@
 
 (deftest test-array-subqueries
   (t/are [file q]
-    (=plan-file file (plan-sql q))
+    (=plan-file file (plan-sql q {:table-info {"a" #{"a"}, "b" #{"b1" "b2"}}}))
 
     "test-array-subquery1" "SELECT ARRAY(select b.b1 from b where b.b2 = 42) FROM a where a.a = 42"
-    "test-array-subquery2" "SELECT ARRAY(select b.b1 from b where b.b2 = a.b) FROM a where a.a = 42"))
+    "test-array-subquery2" "SELECT ARRAY(select b.b1 from b where b.b2 = a.b) FROM a where a.a = 42")
+
+  (xt/submit-tx tu/*node* [[:put-docs :a {:xt/id :a1, :a 42, :b 42}]
+                           [:put-docs :b
+                            {:xt/id :b1, :b1 42, :b2 42}
+                            {:xt/id :b2, :b1 43, :b2 43}]])
+
+  (t/is (= [[42] [43]]
+           (xt/q tu/*node* "SELECT ARRAY(select b.b1 from b) FROM a where a.a = 42")))
+
+  (t/is (= [[42]]
+           (xt/q tu/*node* "SELECT ARRAY(select b.b1 from b where b.b2 = 42) FROM a where a.a = 42")))
+
+  (t/is (= [[42]]
+           (xt/q tu/*node* "SELECT ARRAY(select b.b1 from b where b.b2 = a.b) FROM a where a.a = 42"))))
 
 (t/deftest test-expr-in-equi-join
   (t/is
@@ -826,20 +846,17 @@
         WHERE foo.SYSTEM_TIME OVERLAPS bar.SYSTEM_TIME"))))
 
 (deftest test-valid-time-correlated-subquery
-  (t/is
-   (=plan-file
-    "test-valid-time-correlated-subquery-where"
-    (plan-sql
-     "SELECT (SELECT foo.name
-        FROM foo
-        WHERE foo.VALID_TIME OVERLAPS bar.VALID_TIME) FROM bar")))
+  (t/is (=plan-file
+         "test-valid-time-correlated-subquery-where"
+         (plan-sql "SELECT (SELECT foo.name
+                    FROM foo
+                    WHERE foo.VALID_TIME OVERLAPS bar.VALID_TIME) FROM bar"
+                   {:table-info {"foo" #{"name"}}})))
 
-  (t/is
-   (=plan-file
-    "test-valid-time-correlated-subquery-projection"
-    (plan-sql
-     "SELECT (SELECT (foo.VALID_TIME OVERLAPS bar.VALID_TIME) FROM foo)
-        FROM bar"))))
+  (t/is (=plan-file
+         "test-valid-time-correlated-subquery-projection"
+         (plan-sql "SELECT (SELECT (foo.VALID_TIME OVERLAPS bar.VALID_TIME) FROM foo)
+                    FROM bar"))))
 
 (deftest test-derived-columns-with-periods
   (t/is
@@ -1220,9 +1237,11 @@
 
 (t/deftest test-nest
   (t/is (=plan-file "test-nest-one"
-          (plan-sql "SELECT o.xt$id AS order_id, o.value,
+          (plan-sql "SELECT xt$id AS order_id, value,
                             NEST_ONE(SELECT c.name FROM customers c WHERE c.xt$id = o.customer_id) AS customer
-                     FROM orders o")))
+                     FROM orders o"
+                    {:table-info {"orders" #{"xt$id" "value" "customer_id"}
+                                  "customers" #{"xt$id" "name"}}})))
 
   (t/is (=plan-file "test-nest-many"
           (plan-sql "SELECT c.xt$id AS customer_id, c.name,
@@ -1230,14 +1249,15 @@
                                       FROM orders o
                                       WHERE o.customer_id = c.xt$id)
                               AS orders
-                     FROM customers c")))
+                     FROM customers c"
+                    {:table-info {"orders" #{"xt$id" "value" "customer_id"}
+                                  "customers" #{"xt$id" "name"}}})))
 
   (xt/submit-tx tu/*node* [[:put-docs :customers {:xt/id 0, :name "bob"}]
                            [:put-docs :customers {:xt/id 1, :name "alice"}]
                            [:put-docs :orders {:xt/id 0, :customer-id 0, :value 26.20}]
                            [:put-docs :orders {:xt/id 1, :customer-id 0, :value 8.99}]
                            [:put-docs :orders {:xt/id 2, :customer-id 1, :value 12.34}]])
-
 
   (t/is (= #{{:customer {:name "bob"}, :order-id 0, :value 26.20}
              {:customer {:name "bob"}, :order-id 1, :value 8.99}
