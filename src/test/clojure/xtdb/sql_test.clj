@@ -83,7 +83,7 @@
 
   (t/is (=plan-file
           "basic-query-9"
-          (plan-sql "SELECT me.name, SUM(m.`length`) FROM MovieExec AS me, Movie AS m WHERE me.cert = m.producer GROUP BY me.name HAVING MIN(m.year) < 1930"
+          (plan-sql "SELECT me.name, SUM(m.`length`) FROM MovieExec AS me, Movie AS m WHERE me.cert = m.producer GROUP BY me.name HAVING MIN(m.`year`) < 1930"
                     {:table-info {"movie_exec" #{"name" "cert"}
                                   "movie" #{"producer" "year" "length"}}})))
 
@@ -658,6 +658,33 @@
             AND t2.b1 in (808,662)
             AND t3.c1 in (792,14)
             AND t1.a1 = t2.a2"))))
+
+(t/deftest datascript-test-aggregates
+  (let [_tx (xt/submit-tx tu/*node*
+                          [[:put-docs :docs {:xt/id :cerberus, :heads 3}]
+                           [:put-docs :docs {:xt/id :medusa, :heads 1}]
+                           [:put-docs :docs {:xt/id :cyclops, :heads 1}]
+                           [:put-docs :docs {:xt/id :chimera, :heads 1}]])]
+    (t/is (= #{{:heads 1, :count-heads 3} {:heads 3, :count-heads 1}}
+             (set (xt/q tu/*node*
+                        "SELECT heads, COUNT(heads) AS count_heads FROM docs")))
+          "head frequency")
+
+    (t/is (= #{{:sum-heads 6, :min-heads 1, :max-heads 3, :count-heads 4}}
+             (set (xt/q tu/*node*
+                        "SELECT SUM(heads) AS sum_heads, MIN(heads) AS min_heads, MAX(heads) AS max_heads, COUNT(heads) AS count_heads FROM docs")))
+          "various aggs")
+
+    (t/is (= #{{:heads 1, :count-heads 3}}
+             (set (xt/q tu/*node*
+                        "SELECT heads, COUNT(heads) AS count_heads FROM docs HAVING COUNT(heads) > 1")))
+          "having frequency > 1")
+
+    #_ ; this is a Postgres extension to the SQL syntax that we may want to support at a later date.
+    (t/is (= #{{:heads 1, :count-heads 3}}
+             (set (xt/q tu/*node*
+                        "SELECT heads, COUNT(heads) AS count_heads FROM docs HAVING count_heads > 1")))
+          "having referencing select column")))
 
 (deftest test-group-by-with-projected-column-in-expr
   (t/is (=plan-file
