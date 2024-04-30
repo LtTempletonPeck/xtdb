@@ -7,7 +7,7 @@
             [xtdb.util :as util])
   (:import clojure.lang.MapEntry
            (java.time Duration LocalDate LocalDateTime LocalTime OffsetTime Period ZoneId ZoneOffset ZonedDateTime)
-           (java.util Collection HashMap HashSet LinkedHashSet Map Set)
+           (java.util Collection HashMap HashSet LinkedHashSet Map SequencedSet Set)
            java.util.function.Function
            (org.antlr.v4.runtime CharStreams CommonTokenStream ParserRuleContext)
            (xtdb.antlr SqlLexer SqlLexer SqlParser SqlParser SqlParser$BaseTableContext SqlParser$BaseTableContext SqlParser$DirectSqlStatementContext SqlParser$IntervalQualifierContext SqlParser$IntervalQualifierContext SqlParser$JoinSpecificationContext SqlParser$JoinSpecificationContext SqlParser$JoinTypeContext SqlParser$JoinTypeContext SqlParser$ObjectNameAndValueContext SqlParser$ObjectNameAndValueContext SqlParser$SearchedWhenClauseContext SqlParser$SearchedWhenClauseContext SqlParser$SetClauseContext SqlParser$SetClauseContext SqlParser$SimpleWhenClauseContext SqlParser$SimpleWhenClauseContext SqlParser$SortSpecificationContext SqlParser$WhenOperandContext SqlParser$WhenOperandContext SqlParser$WithTimeZoneContext SqlParser$WithTimeZoneContext SqlVisitor SqlVisitor)
@@ -24,6 +24,7 @@
           (.accept (reify SqlVisitor
                      (visitSchemaName [_ ctx] (.getText ctx))
                      (visitAsClause [this ctx] (-> (.columnName ctx) (.accept this)))
+                     (visitQueryName [this ctx] (-> (.identifier ctx) (.accept this)))
                      (visitTableName [this ctx] (-> (.identifier ctx) (.accept this)))
                      (visitTableAlias [this ctx] (-> (.correlationName ctx) (.accept this)))
                      (visitColumnName [this ctx] (-> (.identifier ctx) (.accept this)))
@@ -38,11 +39,13 @@
 (defprotocol Scope
   (available-cols [scope chain])
   (find-decl [scope chain])
+  (find-cte [scope table-name])
   (plan-scope [scope]))
 
 (extend-protocol Scope nil
   (available-cols [_ _])
   (find-decl [_ _])
+  (find-cte [_ _] nil)
 
   (plan-scope [_]
     [:table [{}]]))
@@ -61,7 +64,10 @@
   Scope
   (find-decl [_ chain]
     (-> (find-decl scope chain)
-        (->sq-sym env !sq-refs))))
+        (->sq-sym env !sq-refs)))
+
+  (find-cte [_ table-name]
+    (find-cte scope table-name)))
 
 (defn- plan-sq [^ParserRuleContext sq-ctx, env, scope, ^Map !subqs, sq-opts]
   (if-not !subqs
@@ -121,8 +127,40 @@
              plan
              subqs))
 
+
 (defrecord AmbiguousColumnReference [chain])
 (defrecord ColumnNotFound [chain])
+
+(defrecord CTE [plan col-syms])
+
+(defrecord WithScope [inner-scope ctes]
+  Scope
+  (available-cols [_ table-name]
+    (if-let [{:keys [cols]} (get ctes table-name)]
+      cols
+      (available-cols inner-scope table-name)))
+
+  (find-decl [_ _chain])
+
+  (find-cte [_ table-name] (get ctes table-name)))
+
+(defrecord WithVisitor [env scope]
+  SqlVisitor
+  (visitWithClause [this ctx]
+    (assert (not (.RECURSIVE ctx)) "Recursive CTEs are not supported yet")
+    (->WithScope scope
+                 (->> (.withListElement ctx)
+                      (reduce (fn [ctes ^ParserRuleContext wle]
+                                (conj ctes (.accept wle (assoc this :scope (->WithScope scope ctes)))))
+                              {}))))
+
+  (visitWithListElement [_ ctx]
+    (let [query-name (identifier-sym (.queryName ctx))]
+      (assert (nil? (.columnNameList ctx)) "Column aliases are not supported yet")
+
+      (let [{:keys [plan col-syms]} (-> (.subquery ctx)
+                                        (.accept (->QueryPlanVisitor env scope)))]
+        (MapEntry/create query-name (->CTE plan col-syms))))))
 
 (defrecord TableTimePeriodSpecificationVisitor [expr-visitor]
   SqlVisitor
@@ -164,7 +202,8 @@
   (find-decl [_ [col-name table-name]]
     (when (or (nil? table-name) (= table-name table-alias))
       (when (or (contains? cols col-name) (types/temporal-column? col-name))
-        (.computeIfAbsent !reqd-cols col-name
+        (.computeIfAbsent !reqd-cols (-> col-name
+                                         (vary-meta assoc :column? true))
                           (reify Function
                             (apply [_ col]
                               (-> (symbol (str unique-table-alias) (str col))
@@ -237,7 +276,7 @@
         [:left-outer-join join-cond planned-r planned-l]
         [join-type join-cond planned-l planned-r]))))
 
-(defrecord DerivedTable [plan table-alias unique-table-alias available-cols col-syms]
+(defrecord DerivedTable [env plan table-alias unique-table-alias ^SequencedSet available-cols]
   Scope
   (available-cols [_ chain]
     (when-not (and chain (not= chain [table-alias]))
@@ -245,8 +284,8 @@
 
   (find-decl [_ [col-name table-name]]
     (when (or (nil? table-name) (= table-name table-alias))
-      (when-let [col (get available-cols col-name)]
-        (symbol (str unique-table-alias) (str col)))))
+      (when (.contains available-cols col-name)
+        (symbol (str unique-table-alias) (str col-name)))))
 
   (plan-scope [_]
     [:rename unique-table-alias
@@ -267,6 +306,8 @@
 
       (or (first matches)
           (find-decl inner-scope chain))))
+
+  (find-cte [_ table-name] (find-cte inner-scope table-name))
 
   (plan-scope [_]
     (case (count table-ref-scopes)
@@ -373,7 +414,9 @@
   (find-decl [_ chain]
     (when-let [sym (find-decl scope chain)]
       (some-> !implied-gicrs (.add sym))
-      sym)))
+      sym))
+
+  (find-cte [_ table-name] (find-cte scope table-name)))
 
 (defn- wrap-aggs [plan aggs group-invariant-cols]
   [:group-by (vec (concat group-invariant-cols
@@ -395,9 +438,14 @@
           table-alias (or (identifier-sym (.tableAlias ctx)) tn)
           unique-table-alias (symbol (str table-alias "." (swap! !id-count inc)))
           cols (some-> (.tableProjection ctx) (->table-projection))]
-      (->BaseTable env ctx sn tn table-alias unique-table-alias
-                   (->insertion-ordered-set (or cols (get table-info tn)))
-                   (HashMap.))))
+      (or (when-not sn
+            (when-let [{:keys [plan], cte-cols :col-syms} (find-cte scope tn)]
+              (->DerivedTable env plan table-alias unique-table-alias
+                              (->insertion-ordered-set (or cols cte-cols)))))
+
+          (->BaseTable env ctx sn tn table-alias unique-table-alias
+                       (->insertion-ordered-set (or cols (get table-info tn)))
+                       (HashMap.)))))
 
   (visitJoinTable [this ctx]
     (let [l (-> (.tableReference ctx 0) (.accept this))
@@ -431,10 +479,9 @@
 
           table-alias (identifier-sym (.tableAlias ctx))]
 
-      (->DerivedTable plan table-alias
+      (->DerivedTable env plan table-alias
                       (symbol (str table-alias "." (swap! !id-count inc)))
-                      (into #{} (map str) col-syms)
-                      col-syms)))
+                      (LinkedHashSet. ^Collection col-syms))))
 
   (visitWrappedTableReference [this ctx] (-> (.tableReference ctx) (.accept this))))
 
@@ -1313,13 +1360,16 @@
   (visitWrappedQuery [this ctx] (-> (.queryExpressionBody ctx) (.accept this)))
 
   (visitQueryExpression [this ctx]
-    (let [order-by-specs (some->> (.orderByClause ctx)
+    (let [scope (or (some-> (.withClause ctx)
+                            (.accept (->WithVisitor env scope)))
+                    scope)
+          order-by-specs (some->> (.orderByClause ctx)
                                   (.sortSpecificationList)
                                   (.sortSpecification)
                                   (map-indexed parse-order-spec))]
 
       (as-> (-> (.queryExpressionBody ctx)
-                (.accept (assoc this :order-by-specs order-by-specs)))
+                (.accept (assoc this :scope scope, :order-by-specs order-by-specs)))
           {:keys [plan col-syms] :as query-expr}
 
         (if order-by-specs
@@ -1814,5 +1864,7 @@
          (vary-meta assoc :param-count @!param-count)))))
 
 (comment
-  (plan-statement "SELECT m.producer, SUM(m.`length`) FROM Movie AS m HAVING MIN(m.`year`) < 1930"
-                  {:table-info {"movie" #{"producer" "year" "length"}}}))
+  (plan-statement "WITH foo AS (SELECT id FROM bar WHERE id = 5)
+                   SELECT foo.id, baz.id
+                   FROM foo, foo AS baz"
+                  {:table-info {"bar" #{"id"}}}))
