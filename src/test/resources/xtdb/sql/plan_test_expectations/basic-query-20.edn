@@ -1,5 +1,5 @@
-[:rename
- {x1 movie_title}
- [:top
-  {:limit 10}
-  [:rename {movie_title x1} [:scan {:table stars_in} [movie_title]]]]]
+[:top
+ {:offset nil, :limit 10}
+ [:project
+  [{movieTitle si.1/movieTitle}]
+  [:rename si.1 [:scan {:table StarsIn} [movieTitle]]]]]
