@@ -1,8 +1,4 @@
 (ns xtdb.pgwire
-  "Defines a postgres wire protocol (pgwire) server for xtdb.
-
-  Start with (serve node)
-  Stop with (.close server)"
   (:require [clojure.data.json :as json]
             [clojure.set :as set]
             [clojure.string :as str]
@@ -10,12 +6,8 @@
             [xtdb.api :as xt]
             [xtdb.node :as xtn]
             [xtdb.node.impl]
-            [xtdb.protocols :as xtp]
             [xtdb.query]
-            [xtdb.rewrite :as r]
-            [xtdb.sql.analyze :as sem]
-            [xtdb.sql.parser :as parser]
-            [xtdb.sql.plan :as plan]
+            [xtdb.sql.plan2 :as plan2]
             [xtdb.time :as time]
             [xtdb.util :as util])
   (:import [clojure.lang PersistentQueue]
@@ -24,16 +16,18 @@
            [java.net ServerSocket Socket SocketException]
            [java.nio ByteBuffer]
            [java.nio.charset StandardCharsets]
-           [java.time Clock Duration LocalDate LocalDateTime OffsetDateTime Period ZoneId ZoneOffset ZonedDateTime]
-           [java.util HashMap List Map]
+           [java.time Clock Duration LocalDate LocalDateTime OffsetDateTime Period ZoneId ZonedDateTime]
+           [java.util List Map]
            [java.util.concurrent ExecutorService Executors TimeUnit]
            [java.util.function Consumer]
+           (org.antlr.v4.runtime ParserRuleContext)
            [org.apache.arrow.vector PeriodDuration]
-           (xtdb.query BoundQuery PreparedQuery)
+           (xtdb.antlr SqlVisitor)
            [xtdb.api PgwireServer$Factory Xtdb$Config]
-           xtdb.node.impl.IXtdbInternal
            xtdb.api.module.XtdbModule
            xtdb.IResultCursor
+           xtdb.node.impl.IXtdbInternal
+           (xtdb.query BoundQuery PreparedQuery)
            [xtdb.types IntervalDayTime IntervalMonthDayNano IntervalYearMonth]
            [xtdb.vector RelationReader]))
 
@@ -376,7 +370,8 @@
    :message msg})
 
 ;;TODO parse errors should return a PSQL parse error
-;;this code is generic, but there are specific ones a well 
+;;this code is generic, but there are specific ones a well
+#_
 (defn- err-parse [parse-failure]
   (let [lines (str/split-lines (parser/failure->str parse-failure))]
     {:severity "ERROR"
@@ -425,9 +420,7 @@
    {:q "show standard_conforming_strings"
     :cols [{:column-name "standard_conforming_strings" :column-oid oid-varchar}]
     :rows [["on"]]}
-   {:q "select current_schema"
-    :cols [{:column-name "current_schema" :column-oid oid-varchar}]
-    :rows [["public"]]}
+
    {:q "show transaction isolation level"
     :cols [{:column-name "transaction_isolation" :column-oid oid-varchar}]
     :rows [["read committed"]]}
@@ -443,12 +436,7 @@
    ;; java.lang.IllegalStateException: Received resultset tuples, but no field structure for them
    {:q "select string_agg(word, ',') from pg_catalog.pg_get_keywords()"
     :cols [{:column-name "col1" :column-oid oid-varchar}]
-    :rows [["xtdb"]]}
-
-   ;; while testing this stops me typing so much
-   {:q "select ping"
-    :cols [{:column-name "ping", :column-oid oid-varchar}]
-    :rows [["pong"]]}])
+    :rows [["xtdb"]]}])
 
 (defn- trim-sql [s]
   (-> s (str/triml) (str/replace #";\s*$" "")))
@@ -468,21 +456,6 @@
 (defn- statement-head [s]
   (-> s (str/split #"\s+") first str/upper-case strip-semi-colon))
 
-(defn- parse-tx-access-mode [tam]
-  (r/zmatch tam
-    [:transaction_access_mode "READ" "ONLY"] :read-only
-    [:transaction_access_mode "READ" "WRITE"] :read-write))
-
-(defn- parse-tx-characteristics [tcs]
-  ;; TODO `:transaction_characteristics` is supposedly variadic with many different options
-  ;; we only support a single access-mode for now.
-  {:access-mode
-   (r/zmatch tcs
-     [:transaction_characteristics ^:z tam] (parse-tx-access-mode tam)
-     [:transaction_characteristics] nil
-
-     nil)})
-
 (defn- interpret-sql [sql]
   (let [sql-trimmed (trim-sql sql)]
     (or (when (str/blank? sql-trimmed)
@@ -491,77 +464,78 @@
         (when-some [canned-response (get-canned-response sql-trimmed)]
           {:statement-type :canned-response, :canned-response canned-response})
 
-        (try
-          (binding [r/*memo* (HashMap.)]
-            (let [z (-> (parser/parse sql-trimmed :directly_executable_statement)
-                        parser/or-throw (r/vector-zip))
-                  zq (r/$ z 1)]
-              (r/zcase zq
-                :query_expression
-                {:statement-type :query
-                 :query sql
-                 :transformed-query sql-trimmed}
+        (.accept (plan2/parse-statement sql-trimmed)
+                 (reify SqlVisitor
+                   (visitDirectSqlStatement [this ctx] (.accept (.directlyExecutableStatement ctx) this))
+                   (visitDirectlyExecutableStatement [this ctx] (-> (.getChild ctx 0) (.accept this)))
 
-                (:insert_statement :delete_statement__searched :update_statement__searched :erase_statement__searched)
-                (do
-                  (-> (sem/analyze-query (r/znode z)) sem/or-throw plan/plan-query)
-                  {:statement-type :dml, :dml-type (r/ctor zq)
-                   :query sql, :transformed-query sql-trimmed})
+                   (visitSetSessionVariableStatement [_ ctx]
+                     {:statement-type :set-session-parameter
+                      :parameter (plan2/identifier-sym (.identifier ctx))
+                      :value (-> (.literal ctx)
+                                 (.accept (plan2/->ExprPlanVisitor nil nil)))})
 
-                :commit_statement {:statement-type :commit}
-                :rollback_statement {:statement-type :rollback}
+                   (visitSetSessionCharacteristicsStatement [this ctx]
+                     (let [[^ParserRuleContext sc & more-scs] (.sessionCharacteristic ctx)]
+                       (assert (nil? more-scs) "pgwire only supports one for now")
 
-                (r/zmatch (r/$ z 1)
-                  [:set_transaction_statement _ _ ^:z tcs]
-                  (into {:statement-type :set-transaction}
-                        (parse-tx-characteristics tcs))
+                       (into {:statement-type :set-session-characteristics}
+                             (.accept sc this))))
 
-                  [:set_session_variable_statement ^:z ident ^:z lit]
-                  {:statement-type :set-session-parameter
-                   :parameter (sem/identifier ident)
-                   :value (plan/expr lit)}
+                   (visitSessionCharacteristic [this ctx]
+                     (let [[^ParserRuleContext txc & more-txcs] (.transactionMode ctx)]
+                       (assert (nil? more-txcs) "pgwire only supports one for now")
+                       (.accept txc this)))
 
-                  [:start_transaction_statement ^:z tcs]
-                  (into {:statement-type :begin} (parse-tx-characteristics tcs))
+                   (visitSetTransactionStatement [this ctx]
+                     (into {:statement-type :set-transaction}
+                           (.accept (.transactionCharacteristics ctx) this)))
 
-                  [:sql_session_statement
-                   [:set_local_time_zone_statement _ _ _ ^:z tz]]
-                  {:statement-type :set-time-zone
-                   :tz (r/zmatch tz
-                         [:time_zone_interval [_ sign]
-                          [:unsigned_integer_literal offset-hours]
-                          [:unsigned_integer_literal offset-mins]]
-                         (ZoneOffset/ofHoursMinutes (cond-> (parse-long offset-hours)
-                                                      (= sign "-") -)
-                                                    (cond-> (parse-long offset-mins)
-                                                      (= sign "-") -))
+                   (visitStartTransactionStatement [this ctx]
+                     (into {:statement-type :begin}
+                           (some-> (.transactionCharacteristics ctx) (.accept this))))
 
-                         [:character_string_literal region]
-                         (ZoneId/of (subs region 1 (dec (count region)))))}
+                   (visitTransactionCharacteristics [this ctx]
+                     (let [[^ParserRuleContext txc & more-txcs] (.transactionMode ctx)]
+                       (assert (nil? more-txcs) "pgwire only supports one for now")
+                       (.accept txc this)))
 
-                  [:sql_session_statement
-                   [:set_session_characteristics_statement _ _ _ _
-                    [:session_characteristic_list
-                     [:session_transaction_characteristics _ ^:z tam]]]]
-                  ;; =>
-                  {:statement-type :set-session-characteristics
-                   :access-mode (parse-tx-access-mode tam)}
+                   (visitReadWriteTransaction [_ _] {:access-mode :read-write})
+                   (visitReadOnlyTransaction [_ _] {:access-mode :read-only})
 
-                  [:set_valid_time_defaults "AS_OF_NOW"]
-                  ;; =>
-                  {:statement-type :set-session-parameter
-                   :parameter :app-time-defaults, :value :as-of-now}
+                   (visitCommitStatement [_ _] {:statement-type :commit})
+                   (visitRollbackStatement [_ _] {:statement-type :rollback})
 
-                  [:set_valid_time_defaults "ISO_STANDARD"]
-                  ;; =>
-                  {:statement-type :set-session-parameter
-                   :parameter :app-time-defaults, :value :iso-standard}
+                   (visitSetValidTimeDefaults [this ctx]
+                     {:statement-type :set-session-parameter, :parameter :app-time-defaults
+                      :value (.accept (.validTimeDefaults ctx) this)})
 
-                  (throw (UnsupportedOperationException. (pr-str {:unhandled (r/znode z)})))))))
+                   (visitValidTimeDefaultAsOfNow [_ _] :as-of-now)
+                   (visitValidTimeDefaultIsoStandard [_ _] :iso-standard)
 
-          (catch xtdb.IllegalArgumentException e
-            {:statement-type :error
-             :err (err-protocol-violation (.getMessage e))})))))
+                   (visitSetTimeZoneStatement [_ ctx]
+                     {:statement-type :set-time-zone
+                      :tz (let [region (.getText (.characterString ctx))]
+                            (ZoneId/of (subs region 1 (dec (count region)))))})
+
+                   (visitInsertStatement [_ _]
+                     {:statement-type :dml, :dml-type :insert
+                      :query sql, :transformed-query sql-trimmed})
+
+                   (visitUpdateStatementSearched [_ _]
+                     {:statement-type :dml, :dml-type :update
+                      :query sql, :transformed-query sql-trimmed})
+
+                   (visitDeleteStatementSearched [_ _]
+                     {:statement-type :dml, :dml-type :delete
+                      :query sql, :transformed-query sql-trimmed})
+
+                   (visitEraseStatementSearched [_ _]
+                     {:statement-type :dml, :dml-type :erase
+                      :query sql, :transformed-query sql-trimmed})
+
+                   (visitQueryExpression [_ _]
+                     {:statement-type :query, :query sql, :transformed-query sql-trimmed}))))))
 
 (defn- json-clj
   "This function is temporary, the long term goal will be to walk arrow directly to generate the json (and later monomorphic
@@ -1276,7 +1250,7 @@
            :else
            (try
              (dotimes [idx (.rowCount ^RelationReader rel)]
-               (let [row (mapv (fn [col-name] (.getObject (.readerForName ^RelationReader rel col-name) idx)) projection)]
+               (let [row (mapv (fn [col-name] (.getObject (.readerForName ^RelationReader rel (str col-name)) idx)) projection)]
                  (cmd-write-msg conn msg-data-row {:vals (mapv json-bytes row)})
                  (vswap! n-rows-out inc)))
 
@@ -1366,11 +1340,11 @@
                                ;; insert <oid> <rows>
                                ;; oid is always 0 these days, its legacy thing in the pg protocol
                                ;; rows is 0 for us cus async
-                               :insert_statement "INSERT 0 0"
+                               :insert "INSERT 0 0"
                                ;; otherwise head <rows>
-                               :delete_statement__searched "DELETE 0"
-                               :update_statement__searched "UPDATE 0"
-                               :erase_statement__searched "ERASE 0")})))
+                               :delete "DELETE 0"
+                               :update "UPDATE 0"
+                               :erase "ERASE 0")})))
 
 (defn cmd-exec-query
   "Given a statement of type :query will execute it against the servers :node and send the results."
@@ -1413,7 +1387,7 @@
         (fn [col]
           (if (map? col)
             (merge defaults col)
-            (assoc defaults :column-name col)))
+            (assoc defaults :column-name (str col))))
         data {:columns (mapv apply-defaults cols)}]
     (cmd-write-msg conn msg-row-description data)))
 
@@ -1505,7 +1479,7 @@
 
 (defn- permissibility-err
   "Returns an error if the given statement, which is otherwise valid - is not permitted (say due to the access mode, transaction state)."
-  [{:keys [conn-state]} {:keys [statement-type] :as stmt}]
+  [{:keys [conn-state]} {:keys [statement-type]}]
   (let [{:keys [transaction]} @conn-state
 
         ;; session access mode is ignored for now (wait for implicit transactions)
