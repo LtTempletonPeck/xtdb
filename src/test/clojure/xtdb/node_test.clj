@@ -150,7 +150,7 @@ VALUES (1, 'Happy 2024!', DATE '2024-01-01'),
 
 (t/deftest test-interval-literal-cce-271
   (t/is (= [{:a #xt/interval-ym "P12M"}]
-           (xt/q tu/*node* "select a.a from (values (1 year)) a (a)"))))
+           (xt/q tu/*node* "select a.a from (values (INTERVAL '1' YEAR)) a (a)"))))
 
 (t/deftest test-overrides-range
   (xt/submit-tx tu/*node* [[:sql "
@@ -257,9 +257,12 @@ WHERE foo.xt$id = 1"]])]
                (q2 {:basis {:at-tx tx2}, :default-all-valid-time? true}))))))
 
 (t/deftest test-error-handling-inserting-strings-into-app-time-cols-397
-  (xt/submit-tx tu/*node* [[:sql "INSERT INTO foo (xt$id, xt$valid_from) VALUES (1, '2018-01-01')"]])
+  (t/is (= (serde/->tx-aborted 0 (time/->instant #inst "2020-01-01")
+                               #xt/runtime-err [:xtdb.expression/invalid-temporal-string "String '2018-01-01' has invalid format for type timestamp with timezone" {}])
+           (xt/execute-tx tu/*node* [[:sql "INSERT INTO foo (xt$id, xt$valid_from) VALUES (1, '2018-01-01')"]])))
 
   ;; TODO check the rollback error when it's available, #401
+  ;; TODO should pass after we throw warnings for querying columns that don't exist
   (t/is (= [] (xt/q tu/*node* "SELECT foo.xt$id FROM foo"))))
 
 (t/deftest test-vector-type-mismatch-245
@@ -309,11 +312,11 @@ WHERE foo.xt$id = 1"]])]
   (xt/submit-tx tu/*node* [[:sql "INSERT INTO t3(xt$id, data) VALUES (1, [2, 3])"]
                            [:sql "INSERT INTO t3(xt$id, data) VALUES (2, [6, 7])"]])
 
-  (t/is (= {{:data [2 3], :data:1 [2 3]} 1
-            {:data [2 3], :data:1 [6 7]} 1
-            {:data [6 7], :data:1 [2 3]} 1
-            {:data [6 7], :data:1 [6 7]} 1}
-           (frequencies (xt/q tu/*node* "SELECT t3.data, t2.data FROM t3, t3 AS t2")))))
+  (t/is (= {{:t3-data [2 3], :t2-data [2 3]} 1
+            {:t3-data [2 3], :t2-data [6 7]} 1
+            {:t3-data [6 7], :t2-data [2 3]} 1
+            {:t3-data [6 7], :t2-data [6 7]} 1}
+           (frequencies (xt/q tu/*node* "SELECT t3.data AS t3_data, t2.data AS t2_data FROM t3, t3 AS t2")))))
 
 (t/deftest test-mutable-data-buffer-bug
   (xt/submit-tx tu/*node* [[:sql "INSERT INTO t1(xt$id) VALUES(1)"]])

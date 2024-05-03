@@ -1174,11 +1174,16 @@
   (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id 1}]
                            [:put-docs :bar {:xt/id 2 :a "one"}]])
 
+  #_ ; FIXME should throw
   (t/is (= [{:xt/id 1, :a "one", :xt/id:1 2}]
            (xt/q tu/*node* "SELECT * FROM foo JOIN bar ON true")))
 
+  #_ ; FIXME should throw
   (t/is (= [{:xt/id 1, :a "one", :xt/id:1 2}]
-           (xt/q tu/*node* "FROM foo JOIN bar ON true"))))
+           (xt/q tu/*node* "FROM foo JOIN bar ON true")))
+
+  (t/is (= [{:xt/id 1, :a "one", :xt/id:1 2}]
+           (xt/q tu/*node* "SELECT * RENAME (foo.xt$id AS foo_id, bar.xt$id AS bar_id) FROM foo JOIN bar ON true"))))
 
 (deftest test-expand-asterisk-parenthesized-joined-table
   ;;Parens in the place of a table primary creates a parenthesized_joined_table

@@ -165,6 +165,7 @@
            (set (xt/q *node* "SELECT u.name FROM users u WHERE u.name IN (?, ?)"
                       {:args ["James" "Matt"]})))))
 
+;; TODO: Verify this is fixed after changes to basic identifier chain & throwing warnings instead of errors on missing fields
 (t/deftest start-and-query-empty-node-re-231-test
   (with-open [n (xtn/start-node {})]
     (t/is (= [] (xt/q n "select a.a from a a" {})))))
@@ -213,22 +214,23 @@
           (t/is (= tx2-expected (all-users tx2)))
           (t/is (= tx1-expected (all-users tx1))))))))
 
+;; TODO: Failure here due to "Missing/empty field"? Why?
 (deftest test-sql-insert
-  (let [tx1 (xt/submit-tx *node*
+  (t/is (= (serde/->tx-committed 0 (time/->instant #inst "2020-01-01"))
+           (xt/execute-tx *node*
                           [[:sql "INSERT INTO users (xt$id, name, xt$valid_from) VALUES (?, ?, ?)"
                             ["dave", "Dave", #inst "2018"]
-                            ["claire", "Claire", #inst "2019"]]])]
+                            ["claire", "Claire", #inst "2019"]]])))
 
-    (t/is (= (serde/->TxKey 0 (time/->instant #inst "2020-01-01")) tx1))
+  (t/is (= (serde/->tx-committed 1 (time/->instant #inst "2020-01-01"))
+           (xt/execute-tx *node*
+                          [[:sql "INSERT INTO people (xt$id, renamed_name, xt$valid_from)
+                                       SELECT users.xt$id, users.name, users.xt$valid_from
+                                       FROM users FOR VALID_TIME AS OF DATE '2019-06-01'
+                                       WHERE users.name = 'Dave'"]])))
 
-    (xt/submit-tx *node*
-                  [[:sql "INSERT INTO people (xt$id, renamed_name, xt$valid_from)
-                            SELECT users.xt$id, users.name, users.xt$valid_from
-                            FROM users FOR VALID_TIME AS OF DATE '2019-06-01'
-                            WHERE users.name = 'Dave'"]])
-
-    (t/is (= [{:renamed-name "Dave"}]
-             (xt/q *node* "SELECT people.renamed_name FROM people FOR VALID_TIME AS OF DATE '2019-06-01'")))))
+  (t/is (= [{:renamed-name "Dave"}]
+           (xt/q *node* "SELECT people.renamed_name FROM people FOR VALID_TIME AS OF DATE '2019-06-01'"))))
 
 (deftest test-sql-insert-app-time-date-398
   (let [tx (xt/submit-tx *node*
@@ -395,6 +397,7 @@
                     :xt/valid-from (time/->zdt #inst "2020-01-01")}}
                  (q tx1)))))))
 
+;; TODO: propagating error node info
 (t/deftest returns-dml-errors-through-execute-tx
   (t/is (= (serde/->tx-aborted 0 #time/instant "2020-01-01T00:00:00Z",
                                {:message-matches? true, :data {::err/error-key :xtdb.sql/parse-error}})
