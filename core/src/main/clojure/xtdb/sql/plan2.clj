@@ -1,6 +1,7 @@
 (ns xtdb.sql.plan2
   (:require [clojure.set :as set]
             [clojure.string :as str]
+            [clojure.tools.logging :as log]
             [xtdb.error :as err]
             [xtdb.logical-plan :as lp]
             [xtdb.types :as types]
@@ -15,6 +16,10 @@
 
 (defn- add-err! [{:keys [!errors]} err]
   (swap! !errors conj err)
+  nil)
+
+(defn- add-warning! [{:keys [!warnings]} err]
+  (swap! !warnings conj err)
   nil)
 
 (declare ->ExprPlanVisitor map->ExprPlanVisitor ->QueryPlanVisitor)
@@ -784,7 +789,7 @@
   (visitColumnReference [{:keys [^Set !ob-col-refs]} ctx]
     (let [chain (rseq (mapv identifier-sym (.identifier (.identifierChain ctx))))]
       (when-let [sym (or (find-decl scope chain)
-                         (add-err! env (->ColumnNotFound chain)))]
+                         (add-warning! env (->ColumnNotFound chain)))]
         (some-> !ob-col-refs (.add sym))
         sym)))
 
@@ -1842,12 +1847,18 @@
                            ->insertion-ordered-set)])
        (into {})))
 
+(defn log-warnings [!warnings]
+  (doseq [warning @!warnings]
+    (log/warn warning)))
+
 (defn plan-expr
   ([sql] (plan-expr sql {}))
 
   ([sql {:keys [scope table-info default-all-valid-time?]}]
    (let [!errors (atom [])
+         !warnings (atom [])
          env {:!errors !errors
+              :!warnings !warnings
               :!id-count (atom 0)
               :!param-count (atom 0)
               :table-info (xform-table-info table-info)
@@ -1859,7 +1870,9 @@
 
      (if-let [errs (not-empty @!errors)]
        (throw (err/illegal-arg :xtdb/sql-error {:errors errs}))
-       plan))))
+       (do
+         (log-warnings !warnings)
+         plan)))))
 
 ;; eventually these data structures will be used as logical plans,
 ;; we won't need an adapter
@@ -1900,25 +1913,29 @@
 
   ([sql {:keys [scope table-info default-all-valid-time?]}]
    (let [!errors (atom [])
+         !warnings (atom [])
          !param-count (atom 0)
          env {:!errors !errors
+              :!warnings !warnings
               :!id-count (atom 0)
               :!param-count !param-count
               :table-info (xform-table-info table-info)
               :default-all-valid-time? (boolean default-all-valid-time?)}
          stmt (-> (parse-statement sql)
                   (.accept (->StmtVisitor env scope)))]
-     (-> (if-let [errs (not-empty @!errors)]
-           (throw (err/illegal-arg :xtdb/sql-error {:errors errs}))
-           (-> stmt
-               #_(doto clojure.pprint/pprint) ;; <<no-commit>>
-               (optimise-stmt) ;; <<no-commit>>
-               #_(doto clojure.pprint/pprint) ;; <<no-commit>>
-               ))
-         (vary-meta assoc :param-count @!param-count)))))
+     (if-let [errs (not-empty @!errors)]
+       (throw (err/illegal-arg :xtdb/sql-error {:errors errs}))
+       (do
+         (log-warnings !warnings)
+         (-> stmt
+             #_(doto clojure.pprint/pprint) ;; <<no-commit>>
+             (optimise-stmt) ;; <<no-commit>>
+             #_(doto clojure.pprint/pprint) ;; <<no-commit>>
+             (vary-meta assoc :param-count @!param-count)))))))
 
 (comment
   (plan-statement "WITH foo AS (SELECT id FROM bar WHERE id = 5)
                    SELECT foo.id, baz.id
                    FROM foo, foo AS baz"
                   {:table-info {"bar" #{"id"}}}))
+
