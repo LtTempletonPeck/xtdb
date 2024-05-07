@@ -10,7 +10,7 @@
            (java.util Collection HashMap HashSet LinkedHashSet Map SequencedSet Set)
            java.util.function.Function
            (org.antlr.v4.runtime CharStreams CommonTokenStream ParserRuleContext)
-           (xtdb.antlr SqlLexer SqlLexer SqlParser SqlParser SqlParser$BaseTableContext SqlParser$BaseTableContext SqlParser$DirectSqlStatementContext SqlParser$IntervalQualifierContext SqlParser$IntervalQualifierContext SqlParser$JoinSpecificationContext SqlParser$JoinSpecificationContext SqlParser$JoinTypeContext SqlParser$JoinTypeContext SqlParser$ObjectNameAndValueContext SqlParser$ObjectNameAndValueContext SqlParser$SearchedWhenClauseContext SqlParser$SearchedWhenClauseContext SqlParser$SetClauseContext SqlParser$SetClauseContext SqlParser$SimpleWhenClauseContext SqlParser$SimpleWhenClauseContext SqlParser$SortSpecificationContext SqlParser$WhenOperandContext SqlParser$WhenOperandContext SqlParser$WithTimeZoneContext SqlParser$WithTimeZoneContext SqlVisitor SqlVisitor)
+           (xtdb.antlr SqlLexer SqlLexer SqlParser SqlParser SqlParser$BaseTableContext SqlParser$BaseTableContext SqlParser$DirectSqlStatementContext SqlParser$IntervalQualifierContext SqlParser$IntervalQualifierContext SqlParser$JoinSpecificationContext SqlParser$JoinSpecificationContext SqlParser$JoinTypeContext SqlParser$JoinTypeContext SqlParser$ObjectNameAndValueContext SqlParser$ObjectNameAndValueContext SqlParser$RenameColumnContext SqlParser$SearchedWhenClauseContext SqlParser$SearchedWhenClauseContext SqlParser$SetClauseContext SqlParser$SetClauseContext SqlParser$SimpleWhenClauseContext SqlParser$SimpleWhenClauseContext SqlParser$SortSpecificationContext SqlParser$WhenOperandContext SqlParser$WhenOperandContext SqlParser$WithTimeZoneContext SqlParser$WithTimeZoneContext SqlVisitor SqlVisitor)
            (xtdb.types IntervalMonthDayNano)))
 
 (defn- add-err! [{:keys [!errors]} err]
@@ -492,39 +492,58 @@
           !subqs (HashMap.)
           !aggs (HashMap.)
 
-          projected-cols (if (.ASTERISK sl-ctx)
-                           (vec (for [col-name (available-cols scope nil)
-                                      :let [sym (find-decl scope [col-name])]]
-                                  (->ProjectedCol sym sym)))
+          projected-cols (.accept sl-ctx
+                                  (reify SqlVisitor
+                                    (visitSelectListAsterisk [_ ctx]
+                                      (let [renames (->> (for [^SqlParser$RenameColumnContext rename-pair (some-> (.renameClause ctx)
+                                                                                                                  (.renameColumn))]
+                                                           (let [chain (rseq (mapv identifier-sym (.identifier (.identifierChain (.columnReference rename-pair)))))
+                                                                 out-col-name (.columnName (.asClause rename-pair))
+                                                                 sym (find-decl scope chain)]
 
-                           (->> (.selectSublist sl-ctx)
-                                (into [] (comp (map-indexed
-                                                (fn [col-idx ^ParserRuleContext sl-elem]
-                                                  (.accept (.getChild sl-elem 0)
-                                                           (reify SqlVisitor
-                                                             (visitDerivedColumn [_ ctx]
-                                                               [(let [expr (.accept (.expr ctx)
-                                                                                    (map->ExprPlanVisitor {:env env, :scope scope, :!subqs !subqs, :!aggs !aggs}))]
-                                                                  (if-let [as-clause (.asClause ctx)]
-                                                                    (let [col-name (identifier-sym as-clause)]
-                                                                      (->ProjectedCol {col-name expr} col-name))
+                                                             (MapEntry/create sym (identifier-sym out-col-name))))
+                                                         (into {}))
 
-                                                                    (if (and (symbol? expr) (not (:agg-out-sym? (meta expr))))
-                                                                      (->ProjectedCol expr expr)
-                                                                      (let [col-name (symbol (str "xt$column_" (inc col-idx)))]
-                                                                        (->ProjectedCol {col-name expr} col-name)))))])
+                                            excludes (when-let [exclude-ctx (.excludeClause ctx)]
+                                                       (into #{} (map identifier-sym) (.identifier exclude-ctx)))]
 
-                                                             (visitQualifiedAsterisk [_ ctx]
-                                                               (let [[table-name schema-name] (rseq (mapv identifier-sym (.identifier (.identifierChain ctx))))]
-                                                                 (when schema-name
-                                                                   (throw (UnsupportedOperationException. "schema not supported")))
+                                        (vec (for [col-name (available-cols scope nil)
+                                                   :when (not (contains? excludes col-name))
+                                                   :let [sym (find-decl scope [col-name])]
+                                                   :when (not (contains? excludes sym))]
+                                               (if-let [renamed-col (get renames sym)]
+                                                 (->ProjectedCol {renamed-col sym} renamed-col)
+                                                 (->ProjectedCol sym sym))))))
 
-                                                                 (if-let [table-cols (available-cols scope table-name)]
-                                                                   (for [col-name table-cols
-                                                                         :let [sym (find-decl scope [col-name table-name])]]
-                                                                     (->ProjectedCol sym sym))
-                                                                   (throw (UnsupportedOperationException. (str "Table not found: " table-name))))))))))
-                                               cat))))]
+                                    (visitSelectListCols [_ ctx]
+                                      (->> (.selectSublist ctx)
+                                           (into [] (comp (map-indexed
+                                                           (fn [col-idx ^ParserRuleContext sl-elem]
+                                                             (.accept (.getChild sl-elem 0)
+                                                                      (reify SqlVisitor
+                                                                        (visitDerivedColumn [_ ctx]
+                                                                          [(let [expr (.accept (.expr ctx)
+                                                                                               (map->ExprPlanVisitor {:env env, :scope scope, :!subqs !subqs, :!aggs !aggs}))]
+                                                                             (if-let [as-clause (.asClause ctx)]
+                                                                               (let [col-name (identifier-sym as-clause)]
+                                                                                 (->ProjectedCol {col-name expr} col-name))
+
+                                                                               (if (and (symbol? expr) (not (:agg-out-sym? (meta expr))))
+                                                                                 (->ProjectedCol expr expr)
+                                                                                 (let [col-name (symbol (str "xt$column_" (inc col-idx)))]
+                                                                                   (->ProjectedCol {col-name expr} col-name)))))])
+
+                                                                        (visitQualifiedAsterisk [_ ctx]
+                                                                          (let [[table-name schema-name] (rseq (mapv identifier-sym (.identifier (.identifierChain ctx))))]
+                                                                            (when schema-name
+                                                                              (throw (UnsupportedOperationException. "schema not supported")))
+
+                                                                            (if-let [table-cols (available-cols scope [table-name])]
+                                                                              (for [col-name table-cols
+                                                                                    :let [sym (find-decl scope [col-name table-name])]]
+                                                                                (->ProjectedCol sym sym))
+                                                                              (throw (UnsupportedOperationException. (str "Table not found: " table-name))))))))))
+                                                          cat))))))]
 
       {:projected-cols (into projected-cols (extended-ob-col-refs order-by-specs env scope (into #{} (map :col-sym) projected-cols)))
        :subqs (not-empty (into {} !subqs))

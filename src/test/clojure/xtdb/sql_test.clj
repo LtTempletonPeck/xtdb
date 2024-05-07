@@ -1147,6 +1147,29 @@
               :xt/valid-from #time/zoned-date-time "2020-01-01T00:00Z[UTC]"}}
              (set (xt/q tu/*node* "SELECT docs.*, docs.xt$valid_from FROM docs WHERE docs.xt$system_to = docs.xt$valid_to")))))
 
+(t/deftest test-select-star-asterisk-clause
+  (xt/submit-tx tu/*node* [[:put-docs :docs {:xt/id 1 :x 3 :y "a"}]
+                           [:put-docs :docs {:xt/id 2 :x 2 :y "b"}]
+                           [:put-docs :docs {:xt/id 3 :x 1 :y "c"}]])
+
+  (t/is (= [{:xt/id 1, :x 3, :y "a"}]
+           (xt/q tu/*node* "SELECT * FROM docs WHERE xt$id = 1")))
+
+  (t/is (= [{:xt/id 1, :y "a"}]
+           (xt/q tu/*node* "SELECT * EXCLUDE x FROM docs WHERE xt$id = 1")))
+
+  (t/is (= [{:xt/id 1}]
+           (xt/q tu/*node* "SELECT * EXCLUDE (x, y) FROM docs WHERE xt$id = 1")))
+
+  (t/is (= [{:xt/id 1, :x 3, :z "a"}]
+           (xt/q tu/*node* "SELECT * RENAME y AS z FROM docs WHERE xt$id = 1")))
+
+  (t/is (= [{:xt/id 1, :y 3, :z "a"}]
+           (xt/q tu/*node* "SELECT * RENAME (x AS y, y AS z) FROM docs WHERE xt$id = 1")))
+
+  (t/is (= [{:xt/id 1, :y 3}]
+           (xt/q tu/*node* "SELECT * EXCLUDE y RENAME (x AS y, y AS z) FROM docs WHERE xt$id = 1"))))
+
 (deftest test-select-star-qualified-join
   (xt/submit-tx tu/*node* [[:put-docs :foo {:xt/id 1}]
                            [:put-docs :bar {:xt/id 2 :a "one"}]])
