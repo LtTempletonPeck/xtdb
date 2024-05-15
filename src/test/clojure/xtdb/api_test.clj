@@ -221,8 +221,19 @@
                           [[:sql "INSERT INTO users (xt$id, name, xt$valid_from) VALUES (?, ?, ?)"
                             ["dave", "Dave", #inst "2018"]
                             ["claire", "Claire", #inst "2019"]]])))
+  
 
-  (t/is (= (serde/->tx-committed 1 (time/->instant #inst "2020-01-01"))
+  (t/is (= (serde/->tx-committed 1 (time/->instant #inst "2020-01-02"))
+           (xt/execute-tx *node*
+                          [[:sql "INSERT INTO people (xt$id, renamed_name)
+                                  SELECT users.xt$id, users.name
+                                  FROM users
+                                  WHERE users.name = 'Claire'"]])))
+
+  (t/is (= [{:renamed-name "Claire"}]
+           (xt/q *node* "SELECT people.renamed_name FROM people")))
+
+  (t/is (= (serde/->tx-committed 2 (time/->instant #inst "2020-01-03"))
            (xt/execute-tx *node*
                           [[:sql "INSERT INTO people (xt$id, renamed_name, xt$valid_from)
                                        SELECT users.xt$id, users.name, users.xt$valid_from

@@ -1582,7 +1582,7 @@
           {:keys [plan col-syms] :as query-expr}
 
         (if out-col-syms
-          (->QueryExpr [:rename (zipmap out-col-syms col-syms)
+          (->QueryExpr [:rename (zipmap col-syms out-col-syms)
                         plan]
                        (into out-col-syms (filter (comp :extended-ob-col-ref meta)) col-syms))
           query-expr)
