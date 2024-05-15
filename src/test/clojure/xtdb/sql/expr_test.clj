@@ -2,6 +2,7 @@
   (:require [clojure.test :as t]
             [xtdb.api :as xt]
             [xtdb.sql.plan2 :as plan]
+            [xtdb.sql-test :as sql-test]
             [xtdb.test-util :as tu])
   (:import (java.time.zone ZoneRulesException)
            [java.util HashMap]))
@@ -958,16 +959,16 @@
       [{}] "SELECT NULLIF(NULL, docs.x) FROM docs")))
 
 ;; TODO ERROR BASH: Handling Error Node Errors
-#_(t/deftest test-period-predicates-point-in-time-erros
+(t/deftest test-period-predicates-point-in-time-erros
   (t/is (thrown-with-msg?
          IllegalArgumentException
-         #"other_column is not a Period"
+         #"mismatched input 'other_column' expecting"
          (sql-test/plan-sql "SELECT f.foo FROM foo f WHERE f.valid_time OVERLAPS f.other_column"
                             {:table-info {"foo" #{"foo" "other_column"}}})))
 
   (t/is (thrown-with-msg?
          IllegalArgumentException
-         #"Invalid SQL query: Parse error at line 1, column 63:"
+         #"line 1:52 mismatched input 'TIMESTAMP' expecting"
          (sql-test/plan-sql
           "SELECT f.foo FROM foo f WHERE f.valid_time OVERLAPS TIMESTAMP '2010-01-01T11:10:11Z'"
           {:table-info {"foo" #{"foo"}}}))))

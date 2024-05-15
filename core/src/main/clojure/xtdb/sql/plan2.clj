@@ -10,7 +10,8 @@
            (java.time Duration LocalDate LocalDateTime LocalTime OffsetTime Period ZoneId ZoneOffset ZonedDateTime)
            (java.util Collection HashMap HashSet LinkedHashSet Map SequencedSet Set)
            java.util.function.Function
-           (org.antlr.v4.runtime CharStreams CommonTokenStream ParserRuleContext)
+           (org.antlr.v4.runtime CharStreams CommonTokenStream ParserRuleContext Recognizer BaseErrorListener)
+           (org.antlr.v4.runtime.misc ParseCancellationException)
            (xtdb.antlr SqlLexer SqlLexer SqlParser SqlParser SqlParser$BaseTableContext SqlParser$BaseTableContext SqlParser$DirectSqlStatementContext SqlParser$IntervalQualifierContext SqlParser$IntervalQualifierContext SqlParser$JoinSpecificationContext SqlParser$JoinSpecificationContext SqlParser$JoinTypeContext SqlParser$JoinTypeContext SqlParser$ObjectNameAndValueContext SqlParser$ObjectNameAndValueContext SqlParser$RenameColumnContext SqlParser$SearchedWhenClauseContext SqlParser$SearchedWhenClauseContext SqlParser$SetClauseContext SqlParser$SetClauseContext SqlParser$SimpleWhenClauseContext SqlParser$SimpleWhenClauseContext SqlParser$SortSpecificationContext SqlParser$WhenOperandContext SqlParser$WhenOperandContext SqlParser$WithTimeZoneContext SqlParser$WithTimeZoneContext SqlVisitor SqlVisitor)
            (xtdb.types IntervalMonthDayNano)))
 
@@ -1899,11 +1900,29 @@
                                                         plan])))]]
                                 '[xt$iid])))))
 
+(defn add-throwing-error-listener [^Recognizer x]
+  (doto x
+    (.removeErrorListeners)
+    (.addErrorListener 
+     (proxy 
+      [BaseErrorListener] []
+       (syntaxError [_ _ line char-position-in-line msg _]
+         (throw 
+          (err/illegal-arg :xtdb/sql-error
+                           {::err/message (str "Errors parsing SQL statement:\n  - "
+                                               (format "line %s:%s %s" line char-position-in-line msg))})
+          #_(ParseCancellationException. (format "line %s:%s %s" line char-position-in-line msg))))))))
+
+#_(err/illegal-arg :xtdb/sql-error
+                 {::err/message (str "Errors parsing SQL statement:\n  - "
+                                     (format "line %s:%s %s" line char-position-in-line msg))})
+
 (defn ->parser ^xtdb.antlr.SqlParser [sql]
-  (-> (CharStreams/fromString sql)
-      (SqlLexer.)
+  (-> (SqlLexer. (CharStreams/fromString sql))
+      (add-throwing-error-listener)
       (CommonTokenStream.)
-      (SqlParser.)))
+      (SqlParser.)
+      (add-throwing-error-listener)))
 
 (defn- xform-table-info [table-info]
   (->> (for [[tn cns] table-info]
@@ -2014,5 +2033,8 @@
   (plan-statement "WITH foo AS (SELECT id FROM bar WHERE id = 5)
                    SELECT foo.id, baz.id
                    FROM foo, foo AS baz"
-                  {:table-info {"bar" #{"id"}}}))
+                  {:table-info {"bar" #{"id"}}})
+  
+  (plan-statement "INSERT INTO foo (xt$id, dt) VALUES ('id', DATE \"2020-01-01\")" {})
+  )
 

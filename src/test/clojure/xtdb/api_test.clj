@@ -165,7 +165,6 @@
            (set (xt/q *node* "SELECT u.name FROM users u WHERE u.name IN (?, ?)"
                       {:args ["James" "Matt"]})))))
 
-;; TODO: Verify this is fixed after changes to basic identifier chain & throwing warnings instead of errors on missing fields
 (t/deftest start-and-query-empty-node-re-231-test
   (with-open [n (xtn/start-node {})]
     (t/is (= [] (xt/q n "select a.a from a a" {})))))
@@ -214,7 +213,6 @@
           (t/is (= tx2-expected (all-users tx2)))
           (t/is (= tx1-expected (all-users tx1))))))))
 
-;; TODO: Failure here due to "Missing/empty field"? Why?
 (deftest test-sql-insert
   (t/is (= (serde/->tx-committed 0 (time/->instant #inst "2020-01-01"))
            (xt/execute-tx *node*
@@ -408,16 +406,11 @@
                     :xt/valid-from (time/->zdt #inst "2020-01-01")}}
                  (q tx1)))))))
 
-;; TODO: propagating error node info
 (t/deftest returns-dml-errors-through-execute-tx
-  (t/is (= (serde/->tx-aborted 0 #time/instant "2020-01-01T00:00:00Z",
-                               {:message-matches? true, :data {::err/error-key :xtdb.sql/parse-error}})
-           (-> (xt/execute-tx tu/*node* [[:sql "INSERT INTO foo (xt$id, dt) VALUES ('id', DATE \"2020-01-01\")"]])
-               (update :error (fn [err]
-                                ;; massive error message
-                                {:message-matches? (boolean (re-find #"Invalid SQL query: Parse error at line 1, column 48:"
-                                                                     (ex-message err)))
-                                 :data (-> (ex-data err) (dissoc :errs))})))))
+  (let [{:keys [committed? error]} (xt/execute-tx tu/*node* [[:sql "INSERT INTO foo (xt$id, dt) VALUES ('id', DATE \"2020-01-01\")"]])]
+    (t/is (not committed?))
+    (t/is (instance? IllegalArgumentException error))
+    (t/is (re-find #"Errors parsing SQL statement" (.getMessage error))))
 
   (t/testing "still an active node"
     (xt/submit-tx tu/*node* [[:sql "INSERT INTO users (xt$id, name) VALUES ('dave', 'Dave')"]])
