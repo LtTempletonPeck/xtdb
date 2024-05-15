@@ -588,10 +588,26 @@
                                                                             (when schema-name
                                                                               (throw (UnsupportedOperationException. "schema not supported")))
 
-                                                                            (if-let [table-cols (available-cols scope [table-name])]
-                                                                              (for [col-name table-cols
-                                                                                    :let [sym (find-decl scope [col-name table-name])]]
-                                                                                (->ProjectedCol sym sym))
+                                                                            (if-let [table-cols (available-cols scope table-name)]
+                                                                              (let [renames (->> (for [^SqlParser$RenameColumnContext rename-pair (some-> (.renameClause ctx)
+                                                                                                                                                          (.renameColumn))]
+                                                                                                   (let [chain (rseq (-> (.columnReference rename-pair) .identifierChain .identifier
+                                                                                                                         (->> (mapv identifier-sym))))
+                                                                                                         out-col-name (.columnName (.asClause rename-pair))
+                                                                                                         sym (find-decl scope chain)]
+
+                                                                                                     (MapEntry/create sym (identifier-sym out-col-name))))
+                                                                                                 (into {}))
+                                                                                    excludes (when-let [exclude-ctx (.excludeClause ctx)]
+                                                                                               (into #{} (map identifier-sym) (.identifier exclude-ctx)))] 
+                                                                                (vec (for [col-name table-cols
+                                                                                           :when (not (contains? excludes col-name))
+                                                                                           :let [sym (find-decl scope [col-name table-name])]
+                                                                                           :when (not (contains? excludes sym))]
+                                                                                       (if-let [renamed-col (get renames sym)]
+                                                                                         (->ProjectedCol {renamed-col sym} renamed-col)
+                                                                                         (->ProjectedCol sym sym)))))
+                                                                              
                                                                               (throw (UnsupportedOperationException. (str "Table not found: " table-name))))))))))
                                                           cat))))))]
 
