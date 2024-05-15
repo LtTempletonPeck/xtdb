@@ -388,7 +388,8 @@ stringLength : expr ;
 // spec additions for date_trunc
 
 dateTruncPrecision
-    : 'YEAR' | 'QUARTER' | 'MONTH' | 'WEEK' | 'DAY'
+    : 'MILLENNIUM' | 'CENTURY' | 'DECADE'
+    | 'YEAR' | 'QUARTER' | 'MONTH' | 'WEEK' | 'DAY'
     | 'HOUR' | 'MINUTE' | 'SECOND'
     | 'MILLISECOND' | 'MICROSECOND' | 'NANOSECOND'
     ;
