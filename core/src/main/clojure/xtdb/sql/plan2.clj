@@ -57,7 +57,12 @@
   (plan-scope [_]
     [:table [{}]]))
 
-(defrecord SubqueryDisallowed [])
+(defprotocol ParserError
+  (error-string [err]))
+
+(defrecord SubqueryDisallowed []
+  ParserError
+  (error-string [_] "Subqueries are not allowed in this context"))
 
 (defn- ->sq-sym [sym {:keys [!id-count]} ^Map !sq-refs]
   (when sym
@@ -134,9 +139,13 @@
              plan
              subqs))
 
+(defrecord AmbiguousColumnReference [chain]
+  ParserError
+  (error-string [_] (format "Ambiguous column reference: %s" (str/join "." (reverse chain)))))
 
-(defrecord AmbiguousColumnReference [chain])
-(defrecord ColumnNotFound [chain])
+(defrecord ColumnNotFound [chain]
+  ParserError
+  (error-string [_] (format "Column not found: %s" (str/join "." (reverse chain)))))
 
 (defrecord CTE [plan col-syms])
 
@@ -373,7 +382,9 @@
     < '>=, > '<=
     <= '>, >= '<))
 
-(defrecord InvalidOrderByOrdinal [out-cols ordinal])
+(defrecord InvalidOrderByOrdinal [out-cols ordinal]
+  ParserError
+  (error-string [_] (format "Invalid order by ordinal: %s - out-cols: %s" ordinal out-cols)))
 
 (defn parse-order-spec [idx ^SqlParser$SortSpecificationContext sort-spec-ctx]
   {:expr-sym (-> (symbol (format "xt$ob_%d" idx))
@@ -426,7 +437,9 @@
 
     (mapv val !extended-ob-col-refs)))
 
-(defrecord MissingGroupingColumns [missing-grouping-cols])
+(defrecord MissingGroupingColumns [missing-grouping-cols]
+  ParserError
+  (error-string [_] (format "Missing grouping columns: %s" missing-grouping-cols)))
 
 (defrecord GroupInvariantColsTracker [env scope, ^Set !implied-gicrs]
   SqlVisitor
@@ -631,7 +644,9 @@
        (long (Math/pow 10 (- 9 (count seconds-fraction)))))
     0))
 
-(defrecord CannotParseDate [d-str msg])
+(defrecord CannotParseDate [d-str msg] 
+  ParserError
+  (error-string [_] (format "Cannot parse date: %s - failed with message %s" d-str msg)))
 
 (defn parse-date-literal [d-str env]
   (try
@@ -639,7 +654,9 @@
     (catch Exception e
       (add-err! env (->CannotParseDate d-str (.getMessage e))))))
 
-(defrecord CannotParseTime [t-str msg])
+(defrecord CannotParseTime [t-str msg]
+  ParserError
+  (error-string [_] (format "Cannot parse time: %s - failed with message %s" t-str msg)))
 
 (defn parse-time-literal [t-str env]
   (if-let [[_ h m s sf offset-str] (re-matches #"(\d{1,2}):(\d{1,2}):(\d{1,2})(?:\.(\d+))?([+-]\d{2}:\d{2})?" t-str)]
@@ -653,7 +670,9 @@
 
     (add-err! env (->CannotParseTime t-str nil))))
 
-(defrecord CannotParseTimestamp [ts-str msg])
+(defrecord CannotParseTimestamp [ts-str msg]
+  ParserError
+  (error-string [_] (format "Cannot parse timestamp: %s - failed with message %s" ts-str msg)))
 
 (defn parse-timestamp-literal [ts-str env]
   (if-let [[_ y mons d h mins s sf ^String offset zone] (re-matches #"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})?(?:\[([\w\/]+)\])?" ts-str)]
@@ -669,7 +688,9 @@
 
     (add-err! env (->CannotParseTimestamp ts-str nil))))
 
-(defrecord CannotParseInterval [i-str msg])
+(defrecord CannotParseInterval [i-str msg]
+  ParserError
+  (error-string [_] (format "Cannot parse interval: %s - failed with message %s" i-str msg)))
 
 (defn parse-iso-interval-literal [i-str env]
   (if-let [[_ p-str d-str] (re-matches #"P([-\dYMWD]+)?(?:T([-\dHMS\.]+)?)?" i-str)]
@@ -685,7 +706,9 @@
 
     (add-err! env (->CannotParseInterval i-str nil))))
 
-(defrecord CannotParseDuration [d-str msg])
+(defrecord CannotParseDuration [d-str msg]
+  ParserError
+  (error-string [_] (format "Cannot parse duration: %s - failed with message %s" d-str msg)))
 
 (defn- parse-duration-literal [d-str env]
   (try
@@ -785,7 +808,9 @@
 
   (visitCharacterStringType [_ _] {:cast-type :utf8}))
 
-(defrecord AggregatesDisallowed [])
+(defrecord AggregatesDisallowed []
+  ParserError
+  (error-string [_] "Aggregates are not allowed in this context"))
 
 (defrecord ExprPlanVisitor [env scope]
   SqlVisitor
@@ -1386,7 +1411,9 @@
       (.accept ps this)
       (parse-long (.getText ctx)))))
 
-(defrecord ColumnCountMismatch [expected given])
+(defrecord ColumnCountMismatch [expected given]
+  ParserError
+  (error-string [_] (format "Column count mismatch: expected %s, given %s" expected given)))
 
 (defprotocol OptimiseStatement
   (optimise-stmt [stmt]))
@@ -1430,7 +1457,9 @@
                  plan]]]
               (with-meta {:col-syms out-cols})))))))
 
-(defrecord DuplicateColumnProjection [col-sym])
+(defrecord DuplicateColumnProjection [col-sym]
+  ParserError
+  (error-string [_] (str "Duplicate column projection: " col-sym)))
 
 (defn dups [seq]
   (for [[id freq] (frequencies seq)
@@ -1911,7 +1940,10 @@
                   (.accept (->ExprPlanVisitor env scope)))]
 
      (if-let [errs (not-empty @!errors)]
-       (throw (err/illegal-arg :xtdb/sql-error {:errors errs}))
+       (throw (err/illegal-arg :xtdb/sql-error
+                               {::err/message (str "Errors planning SQL statement:\n  - "
+                                                   (str/join "\n  - " (map #(error-string %) errs)))
+                                :errors errs}))
        (do
          (log-warnings !warnings)
          plan)))))
@@ -1966,7 +1998,10 @@
          stmt (-> (parse-statement sql)
                   (.accept (->StmtVisitor env scope)))]
      (if-let [errs (not-empty @!errors)]
-       (throw (err/illegal-arg :xtdb/sql-error {:errors errs}))
+       (throw (err/illegal-arg :xtdb/sql-error
+                               {::err/message (str "Errors planning SQL statement:\n  - "
+                                                   (str/join "\n  - " (map #(error-string %) errs)))
+                                :errors errs}))
        (do
          (log-warnings !warnings)
          (-> stmt

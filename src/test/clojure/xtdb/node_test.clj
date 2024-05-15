@@ -435,15 +435,14 @@ VALUES(1, OBJECT ('foo': OBJECT('bibble': true), 'bar': OBJECT('baz': 1001)))"]]
            (set (xt/q tu/*node* "SELECT * EXCLUDE (xt$id) FROM foo, bar"))))
 
   ;; Thrown due to duplicate column projection in the query on `xt$id`
-  ;; TODO: Update error after error propagation changes?
   (t/is (thrown-with-msg? 
          IllegalArgumentException
-         #"xtdb/sql-error" 
+         #"Duplicate column projection: xt\$id" 
          (xt/q tu/*node* "FROM foo, bar")))
   
   (t/is (thrown-with-msg?
          IllegalArgumentException
-         #"xtdb/sql-error"
+         #"Duplicate column projection: xt\$id"
          (xt/q tu/*node* "SELECT bar.*, foo.* FROM foo, bar")))
 
   (t/is (= #{{:a 1 :c 3} {:a 1 :d 4} {:b 2 :c 3} {:b 2 :d 4}}
