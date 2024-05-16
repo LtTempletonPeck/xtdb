@@ -88,9 +88,9 @@ joins-json-2: |
 
 joins-sql-2: |
   -- tag::joins-sql-2[]
-  SELECT u1.xt$id AS uid1, u2.xt$id AS uid2, u1.age
+  SELECT u1.xt$id AS uid1, u2.xt$id AS uid2, u1."age"
   FROM users u1
-    JOIN users u2 ON (u1.age = u2.age)
+    JOIN users u2 ON (u1."age" = u2."age")
   WHERE u1.xt$id <> u2.xt$id
   -- end::joins-sql-2[]
 
