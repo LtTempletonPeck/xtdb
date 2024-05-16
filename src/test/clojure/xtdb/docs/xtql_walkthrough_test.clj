@@ -534,7 +534,6 @@
                           (from :promotions {:bind [promotion-type]
                                              :for-valid-time (from #inst "2023-12-26")})))))))
 
-
 (deftest DML-Delete-bitemporal-sql
   (xt/submit-tx tu/*node* promotions)
 
@@ -547,8 +546,8 @@
                           (from :promotions {:bind [promotion-type]
                                              :for-valid-time (from #inst "2023-12-26")}))))))
 
-  (xt/submit-tx tu/*node*
-    [[:sql (sql-example "DML-Delete-bitemporal-sql")]])
+  (t/is (:committed? (xt/execute-tx tu/*node*
+                                    [[:sql (sql-example "DML-Delete-bitemporal-sql")]])))
 
   (t/is (= #{{:promotion-type "general"}}
            (set

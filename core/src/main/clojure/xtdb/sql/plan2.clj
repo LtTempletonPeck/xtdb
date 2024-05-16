@@ -1745,7 +1745,7 @@
     (let [expr-visitor (->ExprPlanVisitor env scope)
           from-expr (-> (.expr ctx 0) (.accept expr-visitor))
           to-expr (-> (.expr ctx 1) (.accept expr-visitor))]
-      {:for-valid-time [:between from-expr to-expr]
+      {:for-valid-time [:between from-expr (when-not (= to-expr 'xtdb/end-of-time) to-expr)]
        :projection [{'xt$valid_from (cond
                                       from-expr (list 'greatest 'xt$valid_from (list 'cast from-expr types/temporal-col-type))
                                       default-all-valid-time? 'xt$valid_from
