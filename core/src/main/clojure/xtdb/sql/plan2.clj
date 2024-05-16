@@ -1783,16 +1783,16 @@
      (vec @!reqd-cols)]))
 
 (defrecord InsertStmt [table query-plan]
-  OptimiseStatement (optimise-stmt [this] (update this :query-plan lp/rewrite-plan)))
+  OptimiseStatement (optimise-stmt [this] (update-in this [:query-plan :plan] lp/rewrite-plan)))
 
 (defrecord UpdateStmt [table query-plan]
-  OptimiseStatement (optimise-stmt [this] (update this :query-plan lp/rewrite-plan)))
+  OptimiseStatement (optimise-stmt [this] (update-in this [:query-plan :plan] lp/rewrite-plan)))
 
 (defrecord DeleteStmt [table query-plan]
-  OptimiseStatement (optimise-stmt [this] (update this :query-plan lp/rewrite-plan)))
+  OptimiseStatement (optimise-stmt [this] (update-in this [:query-plan :plan] lp/rewrite-plan)))
 
 (defrecord EraseStmt [table query-plan]
-  OptimiseStatement (optimise-stmt [this] (update this :query-plan lp/rewrite-plan)))
+  OptimiseStatement (optimise-stmt [this] (update-in this [:query-plan :plan] lp/rewrite-plan)))
 
 (defrecord StmtVisitor [env scope]
   SqlVisitor
