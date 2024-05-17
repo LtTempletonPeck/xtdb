@@ -1713,7 +1713,7 @@
                      col-syms)
         inner))))
 
-(defrecord DmlTableRef [table-name table-alias for-valid-time cols !reqd-cols]
+(defrecord DmlTableRef [env table-name table-alias unique-table-alias for-valid-time cols !reqd-cols]
   Scope
   (available-cols [_ chain]
     (when-not (and chain (not= chain [table-alias]))
@@ -1723,15 +1723,22 @@
 
   (find-decl [_ [col-name table-name]]
     (when (or (nil? table-name) (= table-name table-alias))
-      (let [col-norm (util/symbol->normal-form-symbol col-name)]
-        (when (or (contains? cols col-norm) (types/temporal-column? col-norm))
-          (swap! !reqd-cols conj (symbol col-name))
-          (symbol col-name)))))
+      (if (or (contains? cols col-name) (types/temporal-column? col-name))
+        (.computeIfAbsent !reqd-cols (-> col-name
+                                         (vary-meta assoc :column? true))
+                          (reify Function
+                            (apply [_ col]
+                              (-> (symbol (str unique-table-alias) (str col))
+                                  (vary-meta assoc :column? true)))))
+        (add-warning! env (format "Column %s not found on table %s" col-name table-alias)))))
 
   (plan-scope [_]
-    [:scan {:table (symbol table-name)
-            :for-valid-time for-valid-time}
-     (vec @!reqd-cols)]))
+    [:rename unique-table-alias
+     [:scan (cond-> {:table (symbol table-name)}
+              for-valid-time (assoc :for-valid-time for-valid-time))
+      (vec (.keySet !reqd-cols))]])
+  
+  (find-cte [_ _] nil))
 
 (defrecord DmlValidTimeExtentsVisitor [env scope]
   SqlVisitor
@@ -1806,20 +1813,20 @@
                   (-> (.insertColumnsAndSource ctx)
                       (.accept (->QueryPlanVisitor env scope)))))
 
-  (visitUpdateStatementSearched [_ ctx]
+  (visitUpdateStatementSearched [{{:keys [!id-count table-info]} :env} ctx]
     (let [internal-cols '[xt$iid xt$valid_from xt$valid_to]
           table-name (util/symbol->normal-form-symbol (identifier-sym (.tableName ctx)))
-          table-alias (identifier-sym (.correlationName ctx))
+          table-alias (or (identifier-sym (.correlationName ctx)) table-name)
+          unique-table-alias (symbol (str table-alias "." (swap! !id-count inc)))
+          aliased-cols (mapv (fn [col] {col (symbol (str unique-table-alias) (str col))}) internal-cols)
 
           {:keys [for-valid-time], vt-projection :projection} (some-> (.dmlStatementValidTimeExtents ctx)
                                                                       (.accept (->DmlValidTimeExtentsVisitor env scope)))
 
-          dml-scope (->DmlTableRef table-name (or table-alias table-name) for-valid-time
-                                   (or (get-in env [:table-info table-name])
+          dml-scope (->DmlTableRef env table-name table-alias unique-table-alias for-valid-time
+                                   (or (get table-info table-name)
                                        (throw (UnsupportedOperationException. "TODO")))
-                                   (atom (set internal-cols)))
-
-          ;; TODO support subqs
+                                   (HashMap. (apply merge aliased-cols)))
 
           expr-visitor (->ExprPlanVisitor env dml-scope)
 
@@ -1831,53 +1838,65 @@
                                                 (.accept (.expr (.updateSource set-clause)) expr-visitor))))
                            (into {}))
 
-          where-selection (some-> (.searchCondition ctx)
-                                  (.accept expr-visitor))
+          where-selection (when-let [search-clause (.searchCondition ctx)]
+                            (let [!subqs (HashMap.)]
+                              {:predicate (.accept search-clause (map->ExprPlanVisitor {:env env, :scope dml-scope, :!subqs !subqs}))
+                               :subqs (not-empty (into {} !subqs))}))
 
           available-cols (available-cols dml-scope nil)
-
-          projection (vec (concat '[xt$iid]
-                                  (or vt-projection (default-vt-extents-projection env))
-                                  (for [col available-cols
-                                        :let [col-sym (symbol col)]]
-                                    (if-let [expr (get set-clauses col)]
-                                      {col-sym expr}
-                                      (find-decl dml-scope [col-sym])))))]
+          col-projections (for [col available-cols
+                                :let [col-sym (symbol col)]]
+                            (if-let [expr (get set-clauses col)]
+                              {col-sym expr}
+                              {col-sym (find-decl dml-scope [col-sym])}))
+          outer-projection (vec (concat '[xt$iid]
+                                        (or vt-projection (default-vt-extents-projection env))
+                                        (map ffirst col-projections)))]
 
       (->UpdateStmt (symbol table-name)
-                    (->QueryExpr [:project projection
-                                  (cond-> (plan-scope dml-scope)
-                                    where-selection ((fn [plan]
-                                                       [:select where-selection
-                                                        plan])))]
+                    (->QueryExpr [:project outer-projection
+                                  (as-> (plan-scope dml-scope) plan
+                    
+                                    (if-let [{:keys [predicate subqs]} where-selection]
+                                      [:select predicate
+                                       (-> plan (apply-sqs subqs))]
+                                      plan)
+                    
+                                    [:project (concat aliased-cols col-projections) plan])]
                                  (into internal-cols available-cols)))))
 
-  (visitDeleteStatementSearched [_ ctx]
+  (visitDeleteStatementSearched [{{:keys [!id-count table-info]} :env} ctx]
     (let [internal-cols '[xt$iid xt$valid_from xt$valid_to]
           table-name (util/symbol->normal-form-symbol (identifier-sym (.tableName ctx)))
-          table-alias (identifier-sym (.correlationName ctx))
+          table-alias (or (identifier-sym (.correlationName ctx)) table-name)
+          unique-table-alias (symbol (str table-alias "." (swap! !id-count inc)))
+          aliased-cols (mapv (fn [col] {col (symbol (str unique-table-alias) (str col))}) internal-cols)
 
           {:keys [for-valid-time], vt-projection :projection} (some-> (.dmlStatementValidTimeExtents ctx)
                                                                       (.accept (->DmlValidTimeExtentsVisitor env scope)))
 
-          dml-scope (->DmlTableRef table-name (or table-alias table-name) for-valid-time
-                                   (or (get-in env [:table-info table-name])
+          dml-scope (->DmlTableRef env table-name table-alias unique-table-alias for-valid-time
+                                   (or (get table-info table-name)
                                        (throw (UnsupportedOperationException. "TODO")))
-                                   (atom (set internal-cols)))
+                                   (HashMap. (into {} aliased-cols)))
 
-          ;; TODO support subqs
-          where-selection (some-> (.searchCondition ctx)
-                                  (.accept (->ExprPlanVisitor env dml-scope)))
+          where-selection (when-let [search-clause (.searchCondition ctx)]
+                            (let [!subqs (HashMap.)]
+                              {:predicate (.accept search-clause (map->ExprPlanVisitor {:env env, :scope dml-scope, :!subqs !subqs}))
+                               :subqs (not-empty (into {} !subqs))}))
 
           projection (into '[xt$iid] (or vt-projection (default-vt-extents-projection env)))]
-
       (->DeleteStmt (symbol table-name)
                     (->QueryExpr [:project projection
-                                  (cond-> (plan-scope dml-scope)
-                                    where-selection ((fn [plan]
-                                                       [:select where-selection
-                                                        plan])))]
-                                 internal-cols))))
+                                  (as-> (plan-scope dml-scope) plan 
+                                    
+                                    (if-let [{:keys [predicate subqs]} where-selection]
+                                      [:select predicate
+                                       (-> plan (apply-sqs subqs))]
+                                      plan)
+                                    
+                                    [:project aliased-cols plan])]
+                                 internal-cols)))) 
 
   (visitEraseStatementSearched [_ ctx]
     (let [table-name (util/symbol->normal-form-symbol (identifier-sym (.tableName ctx)))

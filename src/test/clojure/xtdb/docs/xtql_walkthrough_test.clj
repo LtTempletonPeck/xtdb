@@ -467,9 +467,9 @@
 (deftest DML-Delete-additional-unify-clauses-sql
   (xt/submit-tx tu/*node* (concat posts comments))
 
-  (xt/submit-tx tu/*node*
-    [[:sql (sql-example "DML-Delete-additional-unify-clauses-sql")
-      ["ivan"]]])
+  (t/is (:committed? (xt/execute-tx tu/*node*
+                                    [[:sql (sql-example "DML-Delete-additional-unify-clauses-sql")
+                                      ["ivan"]]])))
 
   (t/is (empty? (xt/q tu/*node*
                       '(unify (from :comments [{:post-id pid}])
@@ -639,9 +639,9 @@
   (t/is (= [{:version 1}]
            (xt/q tu/*node* '(from :documents [version]))))
 
-  (xt/submit-tx tu/*node*
-                [[:sql (sql-example "DML-Update-sql")
-                  ["doc-id"]]])
+  (t/is (:committed? (xt/execute-tx tu/*node*
+                                    [[:sql (sql-example "DML-Update-sql")
+                                      ["doc-id"]]])))
 
   (t/is (= [{:version 2}]
            (xt/q tu/*node* '(from :documents [version])))))
