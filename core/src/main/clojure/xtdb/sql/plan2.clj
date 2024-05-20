@@ -1841,9 +1841,13 @@
           {:keys [for-valid-time], vt-projection :projection} (some-> (.dmlStatementValidTimeExtents ctx)
                                                                       (.accept (->DmlValidTimeExtentsVisitor env scope)))
 
-          dml-scope (->DmlTableRef env table-name table-alias unique-table-alias for-valid-time
-                                   (or (get table-info table-name)
-                                       (throw (UnsupportedOperationException. "TODO")))
+          table-cols (if-let [cols (get table-info table-name)]
+                       cols
+                       (do
+                         (add-warning! env (format "Table %s not found for update" table-name))
+                         #{}))
+
+          dml-scope (->DmlTableRef env table-name table-alias unique-table-alias for-valid-time table-cols
                                    (HashMap. (apply merge aliased-cols)))
 
           expr-visitor (->ExprPlanVisitor env dml-scope)
@@ -1893,9 +1897,13 @@
           {:keys [for-valid-time], vt-projection :projection} (some-> (.dmlStatementValidTimeExtents ctx)
                                                                       (.accept (->DmlValidTimeExtentsVisitor env scope)))
 
-          dml-scope (->DmlTableRef env table-name table-alias unique-table-alias for-valid-time
-                                   (or (get table-info table-name)
-                                       (throw (UnsupportedOperationException. "TODO")))
+          table-cols (if-let [cols (get table-info table-name)]
+                       cols
+                       (do
+                         (add-warning! env (format "Table %s not found for update" table-name))
+                         #{}))
+
+          dml-scope (->DmlTableRef env table-name table-alias unique-table-alias for-valid-time table-cols
                                    (HashMap. (into {} aliased-cols)))
 
           where-selection (when-let [search-clause (.searchCondition ctx)]
