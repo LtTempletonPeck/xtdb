@@ -458,11 +458,13 @@ tableProjection : '(' columnNameList ')' ;
 querySystemTimePeriodSpecification
     : 'FOR' 'SYSTEM_TIME' tableTimePeriodSpecification
     | 'FOR' ALL 'SYSTEM_TIME'
+    | 'FOR' 'SYSTEM_TIME' ALL
     ;
 
 queryValidTimePeriodSpecification
    : 'FOR' 'VALID_TIME' tableTimePeriodSpecification
    | 'FOR' ALL 'VALID_TIME'
+   | 'FOR' 'VALID_TIME' ALL 
    ;
 
 tableTimePeriodSpecification
@@ -694,7 +696,7 @@ deleteStatementSearched
 
 dmlStatementValidTimeExtents : dmlStatementValidTimePortion | dmlStatementValidTimeAll ;
 dmlStatementValidTimePortion : 'FOR' 'PORTION' 'OF' 'VALID_TIME' 'FROM' expr 'TO' expr ;
-dmlStatementValidTimeAll : 'FOR' 'ALL' 'VALID_TIME';
+dmlStatementValidTimeAll : 'FOR' 'ALL' 'VALID_TIME' | 'FOR' 'VALID_TIME' 'ALL' ;
 eraseStatementSearched : 'ERASE' 'FROM' tableName ( 'AS'? correlationName )? ('WHERE' searchCondition)? ;
 
 /// §14.11 <insert statement>
