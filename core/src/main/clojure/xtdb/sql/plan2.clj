@@ -25,6 +25,10 @@
 
 (declare ->ExprPlanVisitor map->ExprPlanVisitor ->QueryPlanVisitor)
 
+(defn- add-column-metadata [x]
+  (-> x
+      (vary-meta assoc :column? true)))
+
 (defn identifier-sym [^ParserRuleContext ctx]
   (some-> ctx
           (.accept (reify SqlVisitor
@@ -90,7 +94,7 @@
     (add-err! env (->SubqueryDisallowed))
 
     (let [sq-sym (-> (symbol (str "xt$sq_" (count !subqs)))
-                     (vary-meta assoc :column? true))
+                     (add-column-metadata))
           !sq-refs (HashMap.)
           query-plan (-> sq-ctx (.accept (->QueryPlanVisitor env (->SubqueryScope env scope !sq-refs))))]
 
@@ -229,11 +233,11 @@
     (when (or (nil? table-name) (= table-name table-alias))
       (when (or (contains? cols col-name) (types/temporal-column? col-name))
         (.computeIfAbsent !reqd-cols (-> col-name
-                                         (vary-meta assoc :column? true))
+                                         (add-column-metadata))
                           (reify Function
                             (apply [_ col]
                               (-> (symbol (str unique-table-alias) (str col))
-                                  (vary-meta assoc :column? true))))))))
+                                  (add-column-metadata))))))))
 
   (plan-scope [{{:keys [default-all-valid-time?]} :env, :as this}]
     (let [expr-visitor (->ExprPlanVisitor env this)]
@@ -317,7 +321,8 @@
   (find-decl [_ [col-name table-name]]
     (when (or (nil? table-name) (= table-name table-alias))
       (when (.contains available-cols col-name)
-        (symbol (str unique-table-alias) (str col-name)))))
+        (-> (symbol (str unique-table-alias) (str col-name))
+            (add-column-metadata)))))
 
   (plan-scope [_]
     [:rename unique-table-alias
@@ -436,7 +441,8 @@
                                       (reify Function
                                         (apply [_ sym]
                                           (-> (->eobr-projection env sym)
-                                              (update :col-sym vary-meta assoc :extended-ob-col-ref chain))))))))))
+                                              (update :col-sym vary-meta assoc :extended-ob-col-ref chain)
+                                              (update :col-sym add-column-metadata))))))))))
 
 (defn- extended-ob-col-refs [order-by-specs env scope projected-col-names]
   (let [!extended-ob-col-refs (HashMap.)
@@ -601,7 +607,7 @@
                                                                                (let [col-name (identifier-sym as-clause)]
                                                                                  (->ProjectedCol {col-name expr} col-name))
 
-                                                                               (if (and (symbol? expr) (not (:agg-out-sym? (meta expr))))
+                                                                               (if (:column? (meta expr))
                                                                                  (->ProjectedCol expr expr)
                                                                                  (let [col-name (or (:identifier (meta expr)) 
                                                                                                     (symbol (str "xt$column_" (inc col-idx))))]
@@ -1316,7 +1322,8 @@
 
   (visitCountStarFunction [{{:keys [!id-count]} :env, :keys [^Map !aggs]} ctx]
     (let [agg-sym (-> (symbol (str "xt$row_count_" (swap! !id-count inc)))
-                      (vary-meta assoc :agg-out-sym? true, :column? true))]
+                      (vary-meta assoc :agg-out-sym? true)
+                      (add-column-metadata))]
       (.put !aggs agg-sym '(row-count))
       agg-sym))
 
@@ -1325,7 +1332,8 @@
       (throw (UnsupportedOperationException. "array-agg sort-spec"))
 
       (let [agg-sym (-> (symbol (str "xt$array_agg_" (swap! !id-count inc)))
-                        (vary-meta assoc :agg-out-sym? true, :column? true))]
+                        (vary-meta assoc :agg-out-sym? true)
+                        (add-column-metadata))]
         (.put !aggs agg-sym
               (list 'array-agg
                     (-> (.expr ctx)
@@ -1336,7 +1344,8 @@
   (visitSetFunction [{{:keys [!id-count]} :env, :keys [^Map !aggs], :as this} ctx]
     (let [set-fn (str/lower-case (.getText (.setFunctionType ctx)))
           agg-sym (-> (symbol (str "xt$" set-fn "_" (swap! !id-count inc)))
-                      (vary-meta assoc :agg-out-sym? true, :column? true))]
+                      (vary-meta assoc :agg-out-sym? true)
+                      (add-column-metadata))]
       (.put !aggs agg-sym
             (list (symbol set-fn)
                   (-> (.expr ctx)
@@ -1440,11 +1449,12 @@
                                                      [extended-ob-col-ref col-sym])))))]
     (reify Scope
       (find-decl [_ chain]
-        (or (get extended-ob-col-refs chain)
-            (when (= 1 (count chain))
-              (let [[col-name] chain]
-                (get available-col-syms (symbol col-name))))
-            (get extended-ob-col-refs chain)))
+        (-> (or (get extended-ob-col-refs chain)
+                (when (= 1 (count chain))
+                  (let [[col-name] chain]
+                    (get available-col-syms (symbol col-name))))
+                (get extended-ob-col-refs chain))
+            (add-column-metadata)))
 
       (plan-scope [this]
         (let [ob-expr-plan-visitor (->ExprPlanVisitor env this)
@@ -1735,11 +1745,11 @@
     (when (or (nil? table-name) (= table-name table-alias))
       (if (or (contains? cols col-name) (types/temporal-column? col-name))
         (.computeIfAbsent !reqd-cols (-> col-name
-                                         (vary-meta assoc :column? true))
+                                         (add-column-metadata))
                           (reify Function
                             (apply [_ col]
                               (-> (symbol (str unique-table-alias) (str col))
-                                  (vary-meta assoc :column? true)))))
+                                  (add-column-metadata)))))
         (add-warning! env (format "Column %s not found on table %s" col-name table-alias)))))
 
   (plan-scope [_]
@@ -1790,8 +1800,9 @@
     (when (or (nil? table-name) (= table-name table-alias))
       (let [col-norm (util/symbol->normal-form-symbol col-name)]
         (when (or (contains? cols col-norm) (types/temporal-column? col-norm))
-          (swap! !reqd-cols conj (symbol col-name))
-          (symbol col-name)))))
+          (let [col-sym (-> (symbol col-name) add-column-metadata)]
+            (swap! !reqd-cols conj col-sym)
+            col-sym)))))
 
   (plan-scope [_]
     [:scan {:table (symbol table-name)
