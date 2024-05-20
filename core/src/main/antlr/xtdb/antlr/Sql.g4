@@ -448,7 +448,7 @@ tableReference
     | subquery tableAlias tableProjection? # DerivedTable
     | 'LATERAL' subquery tableAlias tableProjection? # LateralDerivedTable
     | 'UNNEST' '(' expr ')' ('WITH' 'ORDINALITY')? tableAlias tableProjection? # CollectionDerivedTable
-    | 'ARROW_TABLE' '(' characterString ')' tableAlias tableProjection? # ArrowTable
+    | 'ARROW_TABLE' '(' characterString ')' tableAlias tableProjection # ArrowTable
     | '(' tableReference ')' # WrappedTableReference
     ;
 
