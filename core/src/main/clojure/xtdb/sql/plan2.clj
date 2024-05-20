@@ -1730,7 +1730,7 @@
                      col-syms)
         inner))))
 
-(defrecord DmlTableRef [env table-name table-alias unique-table-alias for-valid-time cols !reqd-cols]
+(defrecord DmlTableRef [env table-name table-alias unique-table-alias for-valid-time cols ^Map !reqd-cols]
   Scope
   (available-cols [_ chain]
     (when-not (and chain (not= chain [table-alias]))
@@ -1785,7 +1785,7 @@
                      (list 'greatest 'xt$valid_from (list 'cast '(current-timestamp) types/temporal-col-type)))}
    'xt$valid_to])
 
-(defrecord EraseTableRef [table-name table-alias cols !reqd-cols]
+(defrecord EraseTableRef [env table-name table-alias unique-table-alias cols ^Map !reqd-cols]
   Scope
   (available-cols [_ chain]
     (when-not (and chain (not= chain [table-alias]))
@@ -1796,16 +1796,22 @@
   (find-decl [_ [col-name table-name]]
     (when (or (nil? table-name) (= table-name table-alias))
       (let [col-norm (util/symbol->normal-form-symbol col-name)]
-        (when (or (contains? cols col-norm) (types/temporal-column? col-norm))
-          (let [col-sym (-> (symbol col-name) add-column-metadata)]
-            (swap! !reqd-cols conj col-sym)
-            col-sym)))))
+        (if (or (contains? cols col-norm) (types/temporal-column? col-norm))
+          (.computeIfAbsent !reqd-cols (add-column-metadata col-name)
+                            (reify Function
+                              (apply [_ col]
+                                (-> (symbol (str unique-table-alias) (str col))
+                                    (add-column-metadata)))))
+          (add-warning! env (format "Column %s not found on table %s" col-name table-alias))))))
 
   (plan-scope [_]
-    [:scan {:table (symbol table-name)
-            :for-system-time :all-time
-            :for-valid-time :all-time}
-     (vec @!reqd-cols)]))
+    [:rename unique-table-alias
+     [:scan {:table (symbol table-name)
+             :for-system-time :all-time
+             :for-valid-time :all-time}
+      (vec (.keySet !reqd-cols))]])
+  
+  (find-cte [_ _] nil))
 
 (defrecord InsertStmt [table query-plan]
   OptimiseStatement (optimise-stmt [this] (update-in this [:query-plan :plan] lp/rewrite-plan)))
@@ -1848,7 +1854,7 @@
                          #{}))
 
           dml-scope (->DmlTableRef env table-name table-alias unique-table-alias for-valid-time table-cols
-                                   (HashMap. (apply merge aliased-cols)))
+                                   (HashMap. ^Map (apply merge aliased-cols)))
 
           expr-visitor (->ExprPlanVisitor env dml-scope)
 
@@ -1904,7 +1910,7 @@
                          #{}))
 
           dml-scope (->DmlTableRef env table-name table-alias unique-table-alias for-valid-time table-cols
-                                   (HashMap. (into {} aliased-cols)))
+                                   (HashMap. ^Map (into {} aliased-cols)))
 
           where-selection (when-let [search-clause (.searchCondition ctx)]
                             (let [!subqs (HashMap.)]
@@ -1924,26 +1930,39 @@
                                     [:project aliased-cols plan])]
                                  internal-cols)))) 
 
-  (visitEraseStatementSearched [_ ctx]
-    (let [table-name (util/symbol->normal-form-symbol (identifier-sym (.tableName ctx)))
-          table-alias (identifier-sym (.correlationName ctx))
-          dml-scope (->EraseTableRef table-name (or table-alias table-name)
-                                     (or (get-in env [:table-info table-name])
-                                         (throw (UnsupportedOperationException. "TODO")))
-                                     (atom '#{xt$iid}))
+  (visitEraseStatementSearched [{{:keys [!id-count table-info]} :env} ctx]
+    (let [internal-cols '[xt$iid]
+          table-name (util/symbol->normal-form-symbol (identifier-sym (.tableName ctx)))
+          table-alias (or (identifier-sym (.correlationName ctx)) table-name)
+          unique-table-alias (symbol (str table-alias "." (swap! !id-count inc)))
+          aliased-cols (mapv (fn [col] {col (symbol (str unique-table-alias) (str col))}) internal-cols)
 
-          ;; TODO support subqs
-          where-selection (some-> (.searchCondition ctx)
-                                  (.accept (->ExprPlanVisitor env dml-scope)))]
+          table-cols (if-let [cols (get table-info table-name)]
+                       cols
+                       (do
+                         (add-warning! env (format "Table %s not found for update" table-name))
+                         #{}))
+
+          dml-scope (->EraseTableRef env table-name table-alias unique-table-alias table-cols
+                                     (HashMap. ^Map (apply merge aliased-cols)))
+
+          where-selection (when-let [search-clause (.searchCondition ctx)]
+                            (let [!subqs (HashMap.)]
+                              {:predicate (.accept search-clause (map->ExprPlanVisitor {:env env, :scope dml-scope, :!subqs !subqs}))
+                               :subqs (not-empty (into {} !subqs))}))]
 
       (->EraseStmt (symbol table-name)
                    (->QueryExpr [:distinct
-                                 [:project '[xt$iid]
-                                  (cond-> (plan-scope dml-scope)
-                                    where-selection ((fn [plan]
-                                                       [:select where-selection
-                                                        plan])))]]
-                                '[xt$iid])))))
+                                 [:project internal-cols
+                                  (as-> (plan-scope dml-scope) plan
+                                  
+                                    (if-let [{:keys [predicate subqs]} where-selection]
+                                      [:select predicate
+                                       (-> plan (apply-sqs subqs))]
+                                      plan)
+                                  
+                                    [:project aliased-cols plan])]]
+                                internal-cols)))))
 
 (defn add-throwing-error-listener [^Recognizer x]
   (doto x

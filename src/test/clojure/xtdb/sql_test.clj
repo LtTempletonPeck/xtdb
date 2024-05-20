@@ -1447,3 +1447,8 @@
                             "DELETE FROM \"T1\" WHERE \"T1\".\"col2\" IN (2000, 3000)"]])
 
   (t/is (= [] (xt/q tu/*node* "SELECT \"T1\".xt$id FROM \"T1\""))))
+
+(deftest test-erase-with-subquery
+  (xt/execute-tx tu/*node* [[:put-docs :docs {:xt/id :foo :bar 1}]])
+  (t/is (:committed? (xt/execute-tx tu/*node* [[:sql "ERASE FROM docs WHERE docs.xt$id IN (SELECT docs.xt$id FROM docs WHERE docs.bar = 1)"]])))
+  (t/is (= [] (xt/q tu/*node* "SELECT * FROM docs"))))
