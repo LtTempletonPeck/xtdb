@@ -1939,12 +1939,7 @@
          (throw 
           (err/illegal-arg :xtdb/sql-error
                            {::err/message (str "Errors parsing SQL statement:\n  - "
-                                               (format "line %s:%s %s" line char-position-in-line msg))})
-          #_(ParseCancellationException. (format "line %s:%s %s" line char-position-in-line msg))))))))
-
-#_(err/illegal-arg :xtdb/sql-error
-                 {::err/message (str "Errors parsing SQL statement:\n  - "
-                                     (format "line %s:%s %s" line char-position-in-line msg))})
+                                               (format "line %s:%s %s" line char-position-in-line msg))})))))))
 
 (defn ->parser ^xtdb.antlr.SqlParser [sql]
   (-> (SqlLexer. (CharStreams/fromString sql))
