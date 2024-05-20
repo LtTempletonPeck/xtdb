@@ -1431,8 +1431,8 @@
             {:xt/id 1, :col1 "fish", :col2 1000}]
            (xt/q tu/*node* "SELECT t1.xt$id, T1.col1, \"t1\".col2 FROM t1")))
 
-  (t/is (= [{:col1 "cat", :avg 2000.0} {:col1 "fish", :avg 1000.0}]
-           (xt/q tu/*node* "SELECT T1.col1, AVG(t1.col2) avg FROM t1 GROUP BY T1.col1")))
+  (t/is (= [{:col1 "cat", :avg-val 2000.0} {:col1 "fish", :avg-val 1000.0}]
+           (xt/q tu/*node* "SELECT T1.col1, AVG(t1.col2) avg_val FROM t1 GROUP BY T1.col1")))
 
   (t/is (= [{:col2 3000}]
            (xt/q tu/*node*
