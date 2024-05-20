@@ -75,6 +75,9 @@
 
 (defrecord SubqueryScope [env, scope, ^Map !sq-refs]
   Scope
+  (available-cols [_ table-name] (available-cols scope table-name))
+  (available-tables [_] (available-tables scope))
+
   (find-decl [_ chain]
     (-> (find-decl scope chain)
         (->sq-sym env !sq-refs)))
