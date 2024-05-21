@@ -585,7 +585,7 @@ VALUES(1, OBJECT ('foo': OBJECT('bibble': true), 'bar': OBJECT('baz': 1001)))"]]
                            [:sql "INSERT INTO t2(xt$id, data) VALUES(2, OBJECT('foo': 2))"]])
 
   (t/is (= [{:foo 2} {}]
-           (xt/q tu/*node* "SELECT t2.data.foo FROM t2"))))
+           (xt/q tu/*node* "SELECT (t2.data).foo FROM t2"))))
 
 (t/deftest distinct-null-2535
   (xt/submit-tx tu/*node* [[:sql "INSERT INTO t1(xt$id, foo) VALUES(1, NULL)"]

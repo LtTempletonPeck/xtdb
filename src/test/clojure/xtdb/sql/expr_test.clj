@@ -962,7 +962,7 @@
 (t/deftest test-period-predicates-point-in-time-erros
   (t/is (thrown-with-msg?
          IllegalArgumentException
-         #"mismatched input 'other_column' expecting"
+         #"line 1:66 mismatched input '<EOF>'"
          (sql-test/plan-sql "SELECT f.foo FROM foo f WHERE f.valid_time OVERLAPS f.other_column"
                             {:table-info {"foo" #{"foo" "other_column"}}})))
 
