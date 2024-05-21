@@ -629,12 +629,12 @@
                                                                                                     (symbol (str "xt$column_" (inc col-idx))))]
                                                                                    (->ProjectedCol {col-name expr} col-name)))))])
 
-                                                                        (visitQualifiedAsterisk [_ ctx]
+                                                                        (visitQualifiedAsterisk [_ ctx] 
                                                                           (let [[table-name schema-name] (rseq (mapv identifier-sym (.identifier (.identifierChain ctx))))]
                                                                             (when schema-name
                                                                               (throw (UnsupportedOperationException. "schema not supported")))
-
-                                                                            (if-let [table-cols (available-cols scope table-name)]
+                                                                            
+                                                                            (if-let [table-cols (available-cols scope [table-name])]
                                                                               (let [renames (->> (for [^SqlParser$RenameColumnContext rename-pair (some-> (.renameClause ctx)
                                                                                                                                                           (.renameColumn))]
                                                                                                    (let [chain (rseq (-> (.columnReference rename-pair) .identifierChain .identifier
