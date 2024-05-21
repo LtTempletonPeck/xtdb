@@ -219,6 +219,10 @@
      (-> ctx (.expr 0) (.accept expr-visitor))
      (-> ctx (.expr 1) (.accept expr-visitor))]))
 
+(defrecord MultipleTimePeriodSpecifications []
+  ParserError
+  (error-string [_] "Multiple time period specifications were specified"))
+
 (defrecord BaseTable [env, ^SqlParser$BaseTableContext ctx
                       schema-name table-name table-alias unique-table-alias cols
                       ^Map !reqd-cols]
@@ -247,7 +251,7 @@
                 (case (count specs)
                   0 nil
                   1 (.accept ^ParserRuleContext (first specs) (->TableTimePeriodSpecificationVisitor expr-visitor))
-                  (throw (UnsupportedOperationException. "multiple time period specifications"))))]
+                  :else (add-err! env (->MultipleTimePeriodSpecifications))))]
         (let [for-vt (or (<-table-time-period-specification (.queryValidTimePeriodSpecification ctx))
                          (when default-all-valid-time? :all-time))
               for-st (<-table-time-period-specification (.querySystemTimePeriodSpecification ctx))]
@@ -1839,6 +1843,10 @@
 (defrecord EraseStmt [table query-plan]
   OptimiseStatement (optimise-stmt [this] (update-in this [:query-plan :plan] lp/rewrite-plan)))
 
+(defrecord SetAtIndexNotSupportedInUpdate []
+  ParserError
+  (error-string [_] "Setting at index not currently supported within update"))
+
 (defrecord StmtVisitor [env scope]
   SqlVisitor
   (visitDirectSqlStatement [this ctx] (-> (.directlyExecutableStatement ctx) (.accept this)))
@@ -1875,7 +1883,7 @@
           set-clauses (->> (for [^SqlParser$SetClauseContext set-clause (->> (.setClauseList ctx) (.setClause))
                                  :let [set-target (.setTarget set-clause)]]
                              (if (.UNSIGNED_INTEGER set-target)
-                               (throw (UnsupportedOperationException. "TODO"))
+                               (add-err! env (->SetAtIndexNotSupportedInUpdate)) 
                                (MapEntry/create (identifier-sym (.columnName (.objectColumn set-target)))
                                                 (.accept (.expr (.updateSource set-clause)) expr-visitor))))
                            (into {}))
