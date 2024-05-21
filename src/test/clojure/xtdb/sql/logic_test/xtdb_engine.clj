@@ -129,13 +129,16 @@
   (get-engine-name [_] "xtdb")
 
   (execute-statement [node statement variables]
-    (if (skip-statement? statement)
-      node
-      (if (:direct-sql slt/*opts*)
-        (execute-sql-statement node statement variables (select-keys slt/*opts* [:decorrelate?]))
+    (cond
+      (skip-statement? statement) node
 
-        (-> (plan2/parse-statement statement)
-            (.accept (->SltStmtVisitor node statement))))))
+      (str/starts-with? statement "CREATE TABLE") (execute-record node (parse-create-table statement))
+      (str/starts-with? statement "CREATE VIEW") (execute-record node (parse-create-view statement))
+
+      (:direct-sql slt/*opts*) (execute-sql-statement node statement variables (select-keys slt/*opts* [:decorrelate?]))
+
+      :else (-> (plan2/parse-statement statement)
+                (.accept (->SltStmtVisitor node statement)))))
 
   (execute-query [this query variables]
     (execute-sql-query this query variables (select-keys slt/*opts* [:decorrelate?]))))
