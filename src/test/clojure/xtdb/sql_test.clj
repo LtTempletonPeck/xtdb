@@ -473,19 +473,25 @@
       (->> "uncorrelated subquery"
            (t/is (=plan-file
                    "subquery-in-join-uncorrelated-subquery"
-                   (plan-sql "select foo.a from foo join bar on bar.c = (select foo.b from foo)"))))
+                   (plan-sql "select foo.a from foo join bar on bar.c = (select foo.b from foo)"
+                             {:table-info {"foo" #{"a" "b"}
+                                           "bar" #{"c"}}}))))
 
       (->> "correlated subquery"
            (t/is (=plan-file
                    "subquery-in-join-correlated-subquery"
-                   (plan-sql "select foo.a from foo join bar on bar.c in (select foo.b from foo where foo.a = bar.b)"))))
+                   (plan-sql "select foo.a from foo join bar on bar.c in (select foo.b from foo where foo.a = bar.b)"
+                             {:table-info {"foo" #{"a" "b"}
+                                           "bar" #{"c"}}}))))
 
       ;; TODO unable to decorr, need to be able to pull the select over the max-1-row
       ;; although should be able to do this now, no such thing as max-1-row any more
       (->> "correlated equalty subquery"
            (t/is (=plan-file
                    "subquery-in-join-correlated-equality-subquery"
-                    (plan-sql "select foo.a from foo join bar on bar.c = (select foo.b from foo where foo.a = bar.b)")))))))
+                    (plan-sql "select foo.a from foo join bar on bar.c = (select foo.b from foo where foo.a = bar.b)"
+                              {:table-info {"foo" #{"a" "b"}
+                                            "bar" #{"c"}}})))))))
 
 (t/deftest parameters-referenced-in-relation-test
   (t/are [expected plan apply-columns]

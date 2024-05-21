@@ -239,6 +239,8 @@
                               (-> (symbol (str unique-table-alias) (str col))
                                   (add-column-metadata))))))))
 
+  (find-cte [_ _] nil)
+
   (plan-scope [{{:keys [default-all-valid-time?]} :env, :as this}]
     (let [expr-visitor (->ExprPlanVisitor env this)]
       (letfn [(<-table-time-period-specification [specs]
@@ -259,7 +261,8 @@
 (defrecord JoinTable [env l r
                       ^SqlParser$JoinTypeContext join-type-ctx
                       ^SqlParser$JoinSpecificationContext join-spec-ctx
-                      common-cols]
+                      common-cols
+                      ^Map !subqs]
   Scope
   (available-cols [_ chain]
     (->> [l r]
@@ -292,7 +295,7 @@
                       :join)
 
           join-cond (or (if common-cols
-                          (vec (for [col-name (doto common-cols prn)]
+                          (vec (for [col-name common-cols]
                                  {(find-decl l [col-name])
                                   (find-decl r [col-name])}))
 
@@ -300,15 +303,20 @@
                                   (.accept
                                    (reify SqlVisitor
                                      (visitJoinCondition [_ ctx]
-                                       (let [expr-visitor (->ExprPlanVisitor env this-scope)]
+                                       (let [expr-visitor (map->ExprPlanVisitor {:env env, :scope this-scope, :!subqs !subqs})]
                                          [(-> (.expr ctx)
                                               (.accept expr-visitor))]))))))
                         [])
           planned-l (plan-scope l)
           planned-r (plan-scope r)]
       (if (= :right-outer-join join-type)
-        [:left-outer-join join-cond planned-r planned-l]
-        [join-type join-cond planned-l planned-r]))))
+        [:left-outer-join (apply-sqs join-cond !subqs)
+         planned-r planned-l]
+        [join-type join-cond planned-l planned-r])))
+
+  (find-cte [_ table-name]
+    (or (find-cte r table-name)
+        (find-cte l table-name))))
 
 (defrecord DerivedTable [env plan table-alias unique-table-alias ^SequencedSet available-cols]
   Scope
@@ -323,6 +331,8 @@
       (when (.contains available-cols col-name)
         (-> (symbol (str unique-table-alias) (str col-name))
             (add-column-metadata)))))
+
+  (find-cte [_ _] nil)
 
   (plan-scope [_]
     [:rename unique-table-alias
@@ -346,7 +356,9 @@
   (plan-scope [_]
     [:rename unique-table-alias
      [:project (vec !table-cols)
-      [:arrow url]]]))
+      [:arrow url]]])
+
+  (find-cte [_ _] nil))
 
 (defrecord FromClauseScope [env inner-scope table-ref-scopes]
   Scope
@@ -516,29 +528,32 @@
                        (HashMap.)))))
 
   (visitJoinTable [this ctx]
-    (let [l (-> (.tableReference ctx 0) (.accept this))
+    (let [!subqs (HashMap.)
+          l (-> (.tableReference ctx 0) (.accept this))
           r (-> (.tableReference ctx 1) (.accept this))
           common-cols (.accept (.joinSpecification ctx)
-                            (reify SqlVisitor
-                              (visitJoinCondition [_ _] nil)
-                              (visitNamedColumnsJoin [_ ctx]
-                                (->> (.columnNameList ctx) (.columnName)
-                                     (into #{} (map identifier-sym))))))]
+                               (reify SqlVisitor
+                                 (visitJoinCondition [_ _] nil)
+                                 (visitNamedColumnsJoin [_ ctx]
+                                   (->> (.columnNameList ctx) (.columnName)
+                                        (into #{} (map identifier-sym))))))]
 
       (->JoinTable env l r (.joinType ctx) (.joinSpecification ctx)
-                   common-cols)))
+                   common-cols !subqs)))
 
   (visitCrossJoinTable [this ctx]
-    (let [l (-> (.tableReference ctx 0) (.accept this))
+    (let [!subqs (HashMap.)
+          l (-> (.tableReference ctx 0) (.accept this))
           r (-> (.tableReference ctx 1) (.accept this))]
-      (->JoinTable env l r :cross-join nil nil)))
+      (->JoinTable env l r :cross-join nil nil !subqs)))
 
   (visitNaturalJoinTable [this ctx]
-    (let [l (-> (.tableReference ctx 0) (.accept this))
+    (let [!subqs (HashMap.)
+          l (-> (.tableReference ctx 0) (.accept this))
           r (-> (.tableReference ctx 1) (.accept this))
           common-cols (set/intersection (available-cols l nil) (available-cols r nil))]
 
-      (->JoinTable env l r (.joinType ctx) nil common-cols)))
+      (->JoinTable env l r (.joinType ctx) nil common-cols !subqs)))
 
   (visitDerivedTable [{{:keys [!id-count]} :env} ctx]
     (let [{:keys [plan col-syms]} (-> (.subquery ctx) (.queryExpression)
@@ -745,8 +760,7 @@
     (let [field (-> (.getChild sdf 0) (.getText) (str/upper-case))
           fp (some-> (.intervalFractionalSecondsPrecision sdf) (.getText) (parse-long))]
       {:start-field field
-       :end-field nil
-       :leading-precision 2
+       :end-field nil :leading-precision 2
        :fractional-precision (or fp 6)})
 
     (let [start-field (-> (.startField ctx) (.nonSecondPrimaryDatetimeField) (.getText) (str/upper-case))
@@ -1749,13 +1763,13 @@
                                   (add-column-metadata)))))
         (add-warning! env (format "Column %s not found on table %s" col-name table-alias)))))
 
+  (find-cte [_ _] nil)
+
   (plan-scope [_]
     [:rename unique-table-alias
      [:scan (cond-> {:table (symbol table-name)}
               for-valid-time (assoc :for-valid-time for-valid-time))
-      (vec (.keySet !reqd-cols))]])
-  
-  (find-cte [_ _] nil))
+      (vec (.keySet !reqd-cols))]]))
 
 (defrecord DmlValidTimeExtentsVisitor [env scope]
   SqlVisitor
